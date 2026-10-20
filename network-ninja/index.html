@@ -49,6 +49,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
 .chipbtn { background: transparent; border: 1px solid var(--line); border-radius: 4px; padding: 5px 10px; font: 600 11px var(--f-display); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
 .chipbtn:hover { color: var(--fg); border-color: var(--dim); }
 .logchip { cursor: default; color: var(--green); border-color: rgba(95,240,168,.35); }
+.logchip[role="button"] { cursor: pointer; }
+.logchip.off { color: var(--faint); border-color: var(--line); }
 
 /* buttons */
 .btn { border: 1px solid var(--line); background: var(--panel2); border-radius: 4px; padding: 9px 16px; font: 600 13px var(--f-display); letter-spacing: .08em; text-transform: uppercase; transition: transform .08s, box-shadow .15s, background .15s; }
@@ -327,6 +329,12 @@ body.playing #play { overflow: hidden; }
 .objs li.fresh { animation: objpop .8s ease-out; }
 @keyframes objpop { 0% { background: rgba(95,240,168,.25); } 100% { background: var(--term); } }
 .objs.static li { background: transparent; }
+.objs li { padding-right: 40px; }
+.objs.static li { padding-right: 10px; }
+.objs .peek { position: absolute; right: 6px; top: 5px; width: 24px; height: 22px; border: 1px solid var(--line); border-radius: 4px; background: var(--panel2); color: var(--dim); font: 700 12px var(--f-mono); padding: 0; }
+.objs .peek:hover { color: var(--amber); border-color: var(--amber); }
+.objcmd { display: block; margin-top: 3px; font: 12px var(--f-mono); color: var(--cyan); white-space: pre-wrap; word-break: break-word; }
+.objs li.done .objcmd { color: var(--green); opacity: .85; }
 .hint.fresh { animation: hintpop 1.8s ease-out; }
 @keyframes hintpop { 0%, 30% { background: rgba(255,182,72,.28); box-shadow: 0 0 0 2px var(--amber); } 100% { background: rgba(255,182,72,.07); box-shadow: none; } }
 
@@ -1552,11 +1560,11 @@ const SCENARIOS = [
     ],
     links: [['sw:ge-0/0/1', 'lap:eth0']],
     objectives: [
-      { t: 'Check the Junos version: show version', test: X => X.ran(/^show version/, 'sw') },
-      { t: 'Enter configuration mode: configure', test: X => X.ran(/^configure$/, 'sw') },
-      { t: 'Set the host-name to ovr-sw2', test: X => X.cand('sw', /^set system host-name ovr-sw2$/) },
-      { t: 'Preview your change: show | compare', test: X => X.compared() },
-      { t: 'Commit, and watch the prompt change', test: X => X.has('sw', 'set system host-name ovr-sw2') },
+      { t: 'Check which Junos version is running', cmd: 'show version', test: X => X.ran(/^show version/, 'sw') },
+      { t: 'Enter configuration mode', cmd: 'configure  (or edit)', test: X => X.ran(/^(configure|edit)$/, 'sw') },
+      { t: 'Set the host-name to ovr-sw2', cmd: 'set system host-name ovr-sw2', test: X => X.cand('sw', /^set system host-name ovr-sw2$/) },
+      { t: 'Preview your change before you commit it', cmd: 'show | compare', test: X => X.compared() },
+      { t: 'Make it real, and watch the prompt change', cmd: 'commit', test: X => X.has('sw', 'set system host-name ovr-sw2') },
     ],
     hints: [
       'Type show version at the > prompt, then configure to switch to the # prompt.',
@@ -1605,10 +1613,10 @@ const SCENARIOS = [
     ],
     links: [['sw:ge-0/0/1', 'prn:eth0'], ['sw:ge-0/0/2', 'pc:eth0']],
     objectives: [
-      { t: 'See the commit history: show system commit', test: X => X.ran(/^show system commit/) },
-      { t: 'See what the last commit changed: show configuration | compare rollback 1', test: X => X.compared(1) },
-      { t: 'In configuration mode, load the previous config: rollback 1', test: X => X.ranCfg(/^rollback 1$/) },
-      { t: 'Commit it, and the printer comes back', test: X => X.same(X.d('sw').committed, X.snap('sw')) },
+      { t: 'Find out who committed what, and when', cmd: 'show system commit', test: X => X.ran(/^show system commit/) },
+      { t: 'See exactly what the last commit changed', cmd: 'show configuration | compare rollback 1', test: X => X.compared(1) },
+      { t: 'Load the previous config into your draft', cmd: 'rollback 1  (in configuration mode)', test: X => X.ranCfg(/^rollback 1$/) },
+      { t: 'Make it live, and the printer comes back', cmd: 'commit', test: X => X.same(X.d('sw').committed, X.snap('sw')) },
     ],
     hints: [
       'show system commit lists every commit: number, time, user, and comment. Number 0 is what is running now.',
@@ -1644,10 +1652,10 @@ const SCENARIOS = [
     ],
     links: [['inet:ge-0/0/0', 'rtr:ge-0/0/0'], ['rtr:ge-0/0/1', 'pc:eth0']],
     objectives: [
-      { t: 'Make a harmless change: set a description on ge-0/0/1', test: X => X.cand('rtr', /^set interfaces ge-0\/0\/1 description /) },
-      { t: 'Commit it with: commit confirmed 1', test: X => X.ev('confirmed', 'rtr') },
+      { t: 'Make a harmless change: a description on ge-0/0/1', cmd: 'set interfaces ge-0/0/1 description "LAN"', test: X => X.cand('rtr', /^set interfaces ge-0\/0\/1 description /) },
+      { t: 'Commit it with a 1-minute automatic rollback', cmd: 'commit confirmed 1', test: X => X.ev('confirmed', 'rtr') },
       { t: 'Do not confirm. Wait about 20 seconds and watch Junos roll it back', test: X => X.ev('autorollback', 'rtr') },
-      { t: 'Set it again, commit confirmed 1, then confirm with a plain commit in time', test: X => X.ev('autorollback', 'rtr') && X.ev('confirm', 'rtr') },
+      { t: 'Do it again, and this time confirm before the timer runs out', cmd: 'commit confirmed 1, then a plain commit', test: X => X.ev('autorollback', 'rtr') && X.ev('confirm', 'rtr') },
       { t: 'Your description survives', test: X => X.ev('confirm', 'rtr') && !X.d('rtr').confirmPending && X.d('rtr').committed.some(l => /^set interfaces ge-0\/0\/1 description /.test(l)) },
     ],
     hints: [
@@ -1689,10 +1697,10 @@ const SCENARIOS = [
     ],
     links: [['sw:ge-0/0/1', 'srv:eth0'], ['sw:ge-0/0/2', 'pc:eth0']],
     objectives: [
-      { t: 'Save the current config as rescue: request system configuration rescue save', test: X => X.ev('rescue-save', 'sw') },
-      { t: 'Look at it: show system configuration rescue', test: X => X.ran(/^show system configuration rescue/) },
-      { t: 'Break it on purpose: delete interfaces ge-0/0/2, then commit', test: X => X.ev('commit', 'sw') && !X.d('sw').committed.some(l => l.startsWith('set interfaces ge-0/0/2 ')) },
-      { t: 'Recover in one line: rollback rescue, then commit', test: X => X.ranCfg(/^rollback rescue/) && X.same(X.d('sw').committed, X.d('sw').rescue) },
+      { t: 'Save the current config as the rescue config', cmd: 'request system configuration rescue save', test: X => X.ev('rescue-save', 'sw') },
+      { t: 'Look at the rescue config you saved', cmd: 'show system configuration rescue', test: X => X.ran(/^show system configuration rescue/) },
+      { t: 'Break it on purpose: remove ge-0/0/2 and commit', cmd: 'delete interfaces ge-0/0/2, then commit', test: X => X.ev('commit', 'sw') && !X.d('sw').committed.some(l => l.startsWith('set interfaces ge-0/0/2 ')) },
+      { t: 'Recover with one command, then commit', cmd: 'rollback rescue, then commit', test: X => X.ranCfg(/^rollback rescue/) && X.same(X.d('sw').committed, X.d('sw').rescue) },
     ],
     hints: [
       'At the > prompt: request system configuration rescue save. It prints nothing when it works. Then show system configuration rescue.',
@@ -1976,8 +1984,8 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     },
     interface: {
       name: 'InterFace', role: 'The villain', color: 'var(--magenta)',
-      blurb: 'The face behind every fat-fingered commit. Loves typos. Hates root causes.',
-      hello: 'InterFace. Remember the name. You\'ll find it in every change log... mwa-ha-ha!',
+      blurb: 'The face behind every fat-fingered commit. Collects typos. Feeds on half-fixed tickets.',
+      hello: 'InterFace. I live in your change logs, I nest in your trunks, and I adore a Friday 4:59 commit. Mwa-ha-ha!',
       svg: `<svg viewBox="0 0 100 100" aria-hidden="true">
         <path d="M14 16 H86 V70 H70 V86 H30 V70 H14 Z" fill="#2a0a17" stroke="#ff4f8b" stroke-width="3.5" stroke-linejoin="round"/>
         <g fill="#ffb648">${[0, 1, 2, 3, 4, 5, 6, 7].map(i => `<rect x="${25.5 + i * 6.5}" y="20" width="3.4" height="10" rx="1"/>`).join('')}</g>
@@ -1990,21 +1998,30 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     },
     dinasty: {
       name: 'DiNaSty', role: 'Keeper of records', color: 'var(--violet)',
-      blurb: 'Knows every name and every number. Reads logs for fun. Her own tickets are coming.',
-      hello: 'DiNaSty, darling. I keep every name and number straight. My own tickets? Coming soon.',
+      blurb: 'Samurai archivist. Knows every name and every number, and never loses a record. Her own tickets are coming.',
+      hello: 'DiNaSty. Every name, every number, every record: filed, sharpened, remembered. My own tickets are coming. Be ready.',
       svg: `<svg viewBox="0 0 100 100" aria-hidden="true">
-        <path d="M74 70 Q93 73 97 52 Q88 66 72 61 Z" fill="#3a2f7a" stroke="#9b8cff" stroke-width="3" stroke-linejoin="round"/>
-        <path d="M50 32 L55 19 L62 31 L69 21 L73 35 L81 29 L80 45 Z" fill="#ff4f8b"/>
-        <path d="M33 52 Q32 31 55 31 Q81 31 81 57 Q81 83 57 85 Q38 86 34 70 Z" fill="#3a2f7a" stroke="#9b8cff" stroke-width="3"/>
-        <rect x="42" y="84" width="9" height="9" rx="2" fill="#3a2f7a" stroke="#9b8cff" stroke-width="2.5"/><rect x="60" y="83" width="9" height="9" rx="2" fill="#3a2f7a" stroke="#9b8cff" stroke-width="2.5"/>
-        <ellipse cx="58" cy="64" rx="14" ry="13" fill="#4b3f9a"/>
-        <path d="M12 45 Q12 28 31 28 Q49 28 51 43 Q51 58 34 60 L20 60 Q12 58 12 45 Z" fill="#3a2f7a" stroke="#9b8cff" stroke-width="3" stroke-linejoin="round"/>
-        <g class="eye"><circle cx="34" cy="40" r="5.6" fill="#fff"/><circle cx="32.6" cy="40.5" r="2.8" fill="#120c30"/></g>
-        <path d="M29 34 L26 30 M33.5 33 L33.5 28.5 M38 34 L41 30" stroke="#c9c0ff" stroke-width="2" stroke-linecap="round"/>
-        <circle cx="17" cy="43" r="1.5" fill="#120c30"/>
-        <path class="jaw" d="M16 51 Q29 59 42 51 Q29 55 16 51 Z" fill="#fff"/>
-        <rect x="47" y="56" width="20" height="15" rx="2" fill="#ffb648" stroke="#120c30" stroke-width="1.5" transform="rotate(-8 57 63)"/>
-        <text x="57" y="66" text-anchor="middle" font-family="Chakra Petch, sans-serif" font-weight="700" font-size="7" fill="#120c30" transform="rotate(-8 57 63)">DNS</text>
+        <path d="M62 22 Q86 10 94 30 Q98 44 88 60 Q90 43 80 35 Q74 31 66 32 Z" fill="#1d1645" stroke="#9b8cff" stroke-width="2.5" stroke-linejoin="round"/>
+        <path d="M18 100 Q20 80 36 76 L64 76 Q80 80 82 100 Z" fill="#3a2f7a" stroke="#9b8cff" stroke-width="2.5"/>
+        <path d="M40 76 L50 92 L60 76" fill="#e9e4ff" stroke="#9b8cff" stroke-width="2"/>
+        <path d="M44.5 76 L50 85 L55.5 76 Z" fill="#ff4f8b"/>
+        <rect x="44" y="67" width="12" height="10" fill="#e8c4a6"/>
+        <ellipse cx="50" cy="50" rx="23" ry="25" fill="#f3d6bd" stroke="#9b8cff" stroke-width="2.5"/>
+        <path d="M26 50 Q24 21 50 20 Q76 21 74 50 Q71 39 65 34 L61 45 L56 34 L50 46 L44 34 L39 45 L35 34 Q29 40 26 50 Z" fill="#1d1645" stroke="#9b8cff" stroke-width="2.5" stroke-linejoin="round"/>
+        <path d="M27 32 Q50 24 73 32 L72 38.5 Q50 30.5 28 38.5 Z" fill="#9b8cff"/>
+        <path d="M27 35 Q14 33 5 41 Q16 39 24 40 Z" fill="#9b8cff"/><path d="M27 36.5 Q16 43 12 54 Q20 45 27 40 Z" fill="#7d6de6"/>
+        <circle cx="50" cy="30" r="2.8" fill="#ffb648"/>
+        <g class="eye"><ellipse cx="40" cy="54" rx="4.6" ry="6" fill="#2a1f66"/><circle cx="41.6" cy="51.4" r="1.8" fill="#fff"/><circle cx="38.8" cy="56" r=".9" fill="#fff"/></g>
+        <g class="eye"><ellipse cx="60" cy="54" rx="4.6" ry="6" fill="#2a1f66"/><circle cx="61.6" cy="51.4" r="1.8" fill="#fff"/><circle cx="58.8" cy="56" r=".9" fill="#fff"/></g>
+        <path d="M34 47 L45 46 M66 47 L55 46" stroke="#1d1645" stroke-width="2" stroke-linecap="round"/>
+        <ellipse cx="34" cy="62" rx="3.5" ry="2" fill="#ff4f8b" opacity=".35"/><ellipse cx="66" cy="62" rx="3.5" ry="2" fill="#ff4f8b" opacity=".35"/>
+        <path class="jaw" d="M45.5 65 Q50 69 54.5 65 Q50 66.6 45.5 65 Z" fill="#b5475f" stroke="#7a2a3d" stroke-width="1"/>
+        <g transform="rotate(-14 80 83)">
+          <rect x="68" y="77" width="24" height="12" rx="2" fill="#ffe2b0" stroke="#120c30" stroke-width="1.5"/>
+          <rect x="65" y="75.5" width="4" height="15" rx="2" fill="#7d6de6" stroke="#120c30" stroke-width="1.2"/>
+          <rect x="91" y="75.5" width="4" height="15" rx="2" fill="#7d6de6" stroke="#120c30" stroke-width="1.2"/>
+          <text x="80" y="86" text-anchor="middle" font-family="Chakra Petch, sans-serif" font-weight="700" font-size="7" fill="#120c30">DNS</text>
+        </g>
       </svg>`,
     },
     kage: {
@@ -2140,7 +2157,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     }
     if (!coachOn) return;
     if (after === total) { fanfare(); say('bitbyte', 'Everything\'s talking again! Close the ticket and file the root cause.', { anim: 'jump', interrupt: true, silent: true }); }
-    else if (after < before) say('interface', pick(['Mwa-ha! You just broke something that WORKED.', 'Ooh, that commit broke something else. Delicious.']), { anim: 'shake', interrupt: true });
+    else if (after < before) say('interface', pick(['Mwa-ha! You just broke something that WORKED.', 'Ooh, that commit broke something else. Delicious.', 'One fix, two outages. You\'re a natural. At MY job.', 'Somewhere a phone just started ringing. Mwa-ha-ha!']), { anim: 'shake', interrupt: true });
     else if (after > before) say('bitbyte', 'Progress! Something that was broken works now. Not everything, though.', { interrupt: true });
     else say('rowdy', 'Committed... and the customer won\'t notice a thing.', { heat: -1, interrupt: true });
   }
@@ -2149,24 +2166,44 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
   let G = null; // current ticket session
 
   /* ---------- play log (saved to the artifact's private store so Claude can review it) ---------- */
-  const LOG = { db: null, ref: null, doc: null, dirty: false, busy: false, again: false, timer: null };
+  // Outside claude.ai (e.g. the GitHub Pages copy) the log goes to a Google Sheet through an Apps Script web app.
+  const SHEET_LOG_URL = '';
+  const LOG = { db: null, ref: null, doc: null, id: null, sheet: false, dirty: false, busy: false, again: false, timer: null };
+  let sheetOn = true;
+  try { sheetOn = localStorage.getItem('rootcause.sheetlog') !== 'off'; } catch (e) { /* ignore */ }
+  function renderLogChip() {
+    const c = document.getElementById('logchip');
+    if (!c) return;
+    if (LOG.db) { c.hidden = false; c.textContent = 'Play log on'; return; }
+    if (!LOG.sheet) { c.hidden = true; return; }
+    c.hidden = false;
+    c.textContent = sheetOn ? 'Play log on' : 'Play log off';
+    c.classList.toggle('off', !sheetOn);
+    c.setAttribute('role', 'button');
+    c.tabIndex = 0;
+    c.title = sheetOn ? 'Finished tickets are sent to a private Google Sheet so Claude can review your play. Click to turn off.' : 'Play log is off. Click to turn it back on.';
+  }
+  if (!(window.claude && window.claude.use) && SHEET_LOG_URL) LOG.sheet = true;
   const elapsed = () => (G ? Math.round((Date.now() - G.t0) / 1000) : 0);
   (async () => {
     try {
       const use = window.claude && window.claude.use;
       if (!use) return;
       const db = await window.claude.use('db');
-      if (db) { LOG.db = db; const c = document.getElementById('logchip'); if (c) c.hidden = false; }
+      if (db) { LOG.db = db; LOG.sheet = false; renderLogChip(); }
     } catch (e) { /* no store in this view */ }
   })();
   function logDisable() {
     LOG.db = null; LOG.doc = null;
-    const c = document.getElementById('logchip'); if (c) c.hidden = true;
+    renderLogChip();
   }
   function logStart() {
-    if (!LOG.db || !G) { LOG.doc = null; return; }
+    const viaSheet = !LOG.db && LOG.sheet && sheetOn;
+    if ((!LOG.db && !viaSheet) || !G) { LOG.doc = null; return; }
     const id = `${G.scn.id}-${G.t0}`;
-    try { LOG.ref = LOG.db.collection('playlog').doc(id); } catch (e) { logDisable(); return; }
+    LOG.id = id;
+    LOG.ref = null;
+    if (LOG.db) { try { LOG.ref = LOG.db.collection('playlog').doc(id); } catch (e) { logDisable(); return; } }
     LOG.doc = {
       ticketId: G.scn.id, ticket: G.scn.ticket, title: G.scn.title, client: G.scn.client,
       startedAt: new Date(G.t0).toISOString(), status: 'in progress', elapsedSec: 0,
@@ -2181,7 +2218,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     LOG.doc.elapsedSec = elapsed();
     LOG.dirty = true;
     clearTimeout(LOG.timer);
-    LOG.timer = setTimeout(logFlush, 6000);
+    LOG.timer = setTimeout(logFlush, LOG.ref ? 6000 : 20000);
   }
   function logEnd(fields) {
     if (!LOG.doc) return;
@@ -2191,7 +2228,16 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     logFlush();
   }
   async function logFlush() {
-    if (!LOG.doc || !LOG.ref) return;
+    if (!LOG.doc) return;
+    if (!LOG.ref && LOG.sheet && sheetOn) {
+      LOG.dirty = false;
+      try {
+        await fetch(SHEET_LOG_URL, { method: 'POST', mode: 'no-cors', keepalive: true, headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+          body: JSON.stringify({ id: LOG.id, source: location.host || 'local', doc: LOG.doc }) });
+      } catch (e) { LOG.dirty = true; }
+      return;
+    }
+    if (!LOG.ref) return;
     if (LOG.busy) { LOG.again = true; return; }
     LOG.busy = true; LOG.dirty = false;
     const ref = LOG.ref, body = JSON.parse(JSON.stringify(LOG.doc));
@@ -2357,7 +2403,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     sfx.bad();
     markStale(); renderMap(); renderChanges(); flushFacts();
     if (G.active && G.active.dev === d.id) updatePrompt();
-    say('interface', 'Tick, tock... you never confirmed it, so Junos put everything back. Annoyingly safe, huh?', { anim: 'shake', interrupt: true });
+    say('interface', 'Tick, tock... you never confirmed it, so Junos put everything back. I HATE that feature.', { anim: 'shake', interrupt: true });
     checkObjectives();
   }
   function showCommits(d) {
@@ -2460,7 +2506,21 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     if (!isDrill(G.scn)) { ol.hidden = true; ol.innerHTML = ''; return; }
     ol.hidden = false;
     ol.innerHTML = '';
-    G.scn.objectives.forEach((o, i) => ol.appendChild(el('li', (G.objDone[i] ? 'done' : '') + (fresh.includes(i) ? ' fresh' : ''), o.t)));
+    G.scn.objectives.forEach((o, i) => {
+      const li = el('li', (G.objDone[i] ? 'done' : '') + (fresh.includes(i) ? ' fresh' : ''), o.t);
+      if (o.cmd) {
+        if (G.objDone[i] || G.peeked.has(i)) li.appendChild(el('code', 'objcmd', o.cmd));
+        else {
+          const b = el('button', 'peek', '?');
+          b.type = 'button';
+          b.title = 'Show the command (−$10)';
+          b.setAttribute('aria-label', 'Show the command for this objective, costs $10');
+          b.addEventListener('click', () => { G.peeked.add(i); G.peeks++; logEv({ ev: 'peek', n: i + 1 }); renderObjectives(); if (G.peeks === 2) say('interface', 'Peeking at the answers? I peek at your configs. We\'re practically the same.', { anim: 'shake' }); });
+          li.appendChild(b);
+        }
+      }
+      ol.appendChild(li);
+    });
   }
   function checkObjectives() {
     if (!G || !isDrill(G.scn) || G.drillDone) return;
@@ -2484,19 +2544,21 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     clearInterval(G.timer);
     clearPending();
     const secs = Math.floor((Date.now() - G.t0) / 1000);
-    const grade = G.hints === 0 ? 'S' : G.hints === 1 ? 'A' : 'B';
+    const helps = G.hints + G.peeks;
+    const grade = helps === 0 ? 'S' : helps <= 2 ? 'A' : 'B';
     const replay = !!prog.done[s.id];
     const lines = [['Drill payout', s.reward]];
     if (G.hints) lines.push([`Hints × ${G.hints}`, -25 * G.hints]);
+    if (G.peeks) lines.push([`Command peeks × ${G.peeks}`, -10 * G.peeks]);
     const total = Math.max(0, lines.reduce((a, l) => a + l[1], 0));
     const earned = [];
-    if (!G.hints) { earned.push('unassisted'); if (!prog.ach.includes('unassisted')) prog.ach.push('unassisted'); }
+    if (!helps) { earned.push('unassisted'); if (!prog.ach.includes('unassisted')) prog.ach.push('unassisted'); }
     if (!replay) { prog.cash += total; prog.rep = Math.min(100, prog.rep + 2); }
     const prev = prog.done[s.id], order = ['C', 'B', 'A', 'S'];
-    if (!prev || order.indexOf(grade) > order.indexOf(prev.grade)) prog.done[s.id] = { grade, score: 100 - G.hints * 15 };
+    if (!prev || order.indexOf(grade) > order.indexOf(prev.grade)) prog.done[s.id] = { grade, score: 100 - G.hints * 15 - G.peeks * 7 };
     save();
     renderHeader();
-    logEnd({ status: 'complete', grade, payout: replay ? 0 : total, hints: G.hints, notes: notesText() });
+    logEnd({ status: 'complete', grade, payout: replay ? 0 : total, hints: G.hints, peeks: G.peeks, notes: notesText() });
     fanfare();
     const mm = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
     const card = modal(`
@@ -2511,13 +2573,13 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
           <tr class="tot"><td>${replay ? 'Total (replay, no payout)' : 'Total'}</td><td>$${total}</td></tr>
           <tr><td>Reputation</td><td>${replay ? '—' : '+2'}</td></tr></table>
           <div class="earned">${earned.map(k => `<span class="ach got" title="${esc(ACH[k][1])}">${esc(ACH[k][0])}</span>`).join('')}</div>
-          <p class="eyebrow">Objectives</p><ol class="objs static">${s.objectives.map(o => `<li class="done">${esc(o.t)}</li>`).join('')}</ol>
+          <p class="eyebrow">Objectives</p><ol class="objs static">${s.objectives.map(o => `<li class="done">${esc(o.t)}${o.cmd ? `<code class="objcmd">${esc(o.cmd)}</code>` : ''}</li>`).join('')}</ol>
         </div>
         <div class="story"><p class="eyebrow">What you just practiced</p>${s.debrief.map(p => `<p>${esc(p)}</p>`).join('')}</div>
       </div>
       <div class="modal-actions"><button class="btn primary" id="to-queue">Back to the path</button></div>`, 'wide');
     card.querySelector('#to-queue').addEventListener('click', () => { closeModal(); showBoard(); });
-    setTimeout(() => say('bitbyte', grade === 'S' ? 'No hints, every objective. That is muscle memory forming!' : 'Drill done! Those commands will start to feel normal soon.', { anim: 'jump', silent: true }), 700);
+    setTimeout(() => say('bitbyte', grade === 'S' ? 'No hints, no peeks, every objective. That is muscle memory forming!' : 'Drill done! Those commands will start to feel normal soon.', { anim: 'jump', silent: true }), 700);
   }
 
   /* ---------- board ---------- */
@@ -2569,7 +2631,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     const net = RC.buildNet(scn);
     G = { scn, net, tabs: [], active: null, t0: Date.now(), hints: 0, fails: 0, readLogs: false, timer: null, coachUsed: coachOn, lastSig: null, errs: 0,
       cmds: [], ev: [], facts: new Map(), factsDirty: false, labelsOn: scn.labels !== false, notesOpen: false,
-      objDone: (scn.objectives || []).map(() => false), drillDone: false, snap: {}, kageMoments: [], wentCold: false, kageDirect: false, kageConfirmed: false };
+      objDone: (scn.objectives || []).map(() => false), drillDone: false, snap: {}, peeked: new Set(), peeks: 0, kageMoments: [], wentCold: false, kageDirect: false, kageConfirmed: false };
     for (const d of Object.values(net.dev)) if (RC.isNet(d)) G.snap[d.id] = d.history[0] ? d.history[0].slice() : null;
     $('#notes-pane').hidden = true;
     $('#notes-ta').value = (prog.notes && prog.notes[id]) || '';
@@ -2808,6 +2870,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     traceroute: { '<host>': null },
     request: { system: { configuration: { rescue: { save: null, delete: null } } } },
     configure: null,
+    edit: null,
     help: null,
     clear: null,
     exit: null,
@@ -3014,7 +3077,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     }
     if (G && s.errNote && coachOn && /syntax error|unknown command|ambiguous|not recognized|command not found|missing argument|invalid value|Usage:/i.test(s.errNote)) {
       G.errs++;
-      if (G.errs === 1 || G.errs % 3 === 0) say('interface', pick(['Typos! My favorite snack.', 'Syntax error? Delicious. (Psst: ? lists what can come next.)', 'The CLI didn\'t like that. Tab and ? are your friends. Not that I care.']), { anim: 'shake', interrupt: true });
+      if (G.errs === 1 || G.errs % 3 === 0) say('interface', pick(['Typos! My favorite snack.', 'Syntax error? Delicious. (Psst: ? lists what can come next. Not that I want you to know.)', 'Junos has thirty years of docs and you went with THAT?', 'Do it again. I wasn\'t ready to laugh the first time.', 'The CLI rejected you. Join the club. We have jackets.', 'Tab completes words. Not that you\'d use it. Heh.']), { anim: 'shake', interrupt: true });
     }
     if (G) flushFacts();
     if (line.trim()) logEv(Object.assign({ ev: 'cmd', dev: G ? G.net.dev[s.dev].name : '?', mode: modeBefore, cmd: line.trim().slice(0, 300) }, s.errNote ? { err: String(s.errNote).trim().slice(0, 160) } : {}, heat ? { heat: heat.h } : {}));
@@ -3064,7 +3127,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     if (c0 === 'help') return opHelp();
     if (c0 === 'clear') { s.screen.innerHTML = ''; return null; }
     if (c0 === 'exit' || c0 === 'quit') { closeTab(s); return null; }
-    if (c0 === 'configure') {
+    if (c0 === 'configure' || c0 === 'edit') {
       if (!d.candidate) d.candidate = d.committed.slice();
       s.mode = 'cfg'; s.path = [];
       const changed = d.candidate.join('\n') !== d.committed.join('\n');
@@ -3113,7 +3176,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       '  show lldp neighbors              show log messages',
       '  show configuration [path] [| display set]',
       '  ping <ip> [count n]              traceroute <ip>',
-      '  configure                        clear / exit',
+      '  configure (or edit)              clear / exit',
       '  show system commit               request system configuration rescue save',
       '  show configuration | compare rollback <n>',
       'Pipes: | match <text>  | except <text>  | count  | last <n>',
@@ -3381,7 +3444,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     if (w === 'run') {
       const r = RC.walkTree(OP_TREE, rest);
       if (!r.ok) { print(s, r.error, 'err'); return; }
-      if (r.tokens[0] === 'configure') { print(s, 'error: already in configuration mode', 'err'); return; }
+      if (r.tokens[0] === 'configure' || r.tokens[0] === 'edit') { print(s, 'error: already in configuration mode', 'err'); return; }
       s.cmdKey = r.tokens.join(' ');
       if (['show', 'ping', 'traceroute'].includes(r.tokens[0])) s.heatKey = r.tokens.join(' ') + (mods.compare ? ' | compare' : '');
       const res = opRun(s, d, r.tokens, mods);
@@ -3709,7 +3772,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       b.focus();
     } else {
       G.fails++;
-      say('interface', pick(['Still broken! Mwa-ha-ha!', 'The customer called. It\'s STILL broken. Heh heh.']), { anim: 'shake', interrupt: true });
+      say('interface', pick(['Still broken! Mwa-ha-ha!', 'The customer called. It\'s STILL broken. Heh heh.', 'Closing a ticket doesn\'t fix it, genius. Ask me how I know.', 'The users are testing it now. Hear that? That\'s screaming.']), { anim: 'shake', interrupt: true });
       const p = el('p', 'note bad', `${G.scn.reporter.split(',')[0]}: "It's still broken." (−$50, −3 rep)`);
       card.insertBefore(p, act);
       const b = el('button', 'btn primary', 'Back to work');
@@ -3810,7 +3873,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     setTimeout(() => {
       if (moments.length) say('kage', moments[0][1], { anim: 'ninja', ms: 7000, interrupt: true });
       else if (rcaOk) say('bitbyte', grade === 'S' ? 'FLAWLESS! Somebody frame that ticket.' : pick(['Root cause nailed. The customer got the real answer!', 'That\'s how it\'s done. On to the next one!']), { anim: 'jump', silent: true });
-      else say('interface', 'Fixed it, but blamed the wrong thing? Half pay! Heh heh heh.', { anim: 'shake' });
+      else say('interface', pick(['Fixed it, but blamed the wrong thing? Half pay! Heh heh heh.', 'Wrong root cause. It\'ll be back. I\'ll make sure of it.', 'You treated the symptom. I LOVE symptoms.']), { anim: 'shake' });
     }, 700);
   }
 
@@ -3850,6 +3913,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       logEv({ ev: 'hint', n: G.hints });
       renderHints(true);
       say('bitbyte', `Hint ${G.hints} of ${G.scn.hints.length}: ${G.scn.hints[G.hints - 1]}`, { interrupt: true });
+      if (G.hints >= 2) say('interface', pick(['Another hint? Shall I hold your packets for you too?', 'Hints. How adorable. Kage would never.', 'Keep buying hints. I take a cut.']), { anim: 'shake' });
     });
     $('#resolve-btn').addEventListener('click', resolve);
     $('#abandon-btn').addEventListener('click', () => {
@@ -3872,6 +3936,17 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       if (coachOn) say('rowdy', 'I\'M BACK! Did ya miss me?', { anim: 'jump', interrupt: true });
       else { hushMascots(); flash('Coach muted. Close a ticket without him for the Cold Read badge.'); }
     });
+    const toggleSheet = () => {
+      if (!LOG.sheet) return;
+      sheetOn = !sheetOn;
+      try { localStorage.setItem('rootcause.sheetlog', sheetOn ? 'on' : 'off'); } catch (e) { /* ignore */ }
+      if (!sheetOn) LOG.doc = null;
+      renderLogChip();
+      flash(sheetOn ? 'Play log on. New tickets will be logged.' : 'Play log off. Nothing will be sent.');
+    };
+    $('#logchip').addEventListener('click', toggleSheet);
+    $('#logchip').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSheet(); } });
+    renderLogChip();
     $('#mascot').addEventListener('click', () => hideMascot());
     $('#mascot').addEventListener('mouseenter', () => { if (M.cur) clearTimeout(M.hideT); });
     $('#mascot').addEventListener('mouseleave', () => { if (!M.cur) return; const g = M.gen; clearTimeout(M.hideT); M.hideT = setTimeout(() => hideMascot(g), 1800); });
