@@ -245,6 +245,7 @@ body.playing #play { overflow: hidden; }
 
 #mascot { position: fixed; right: 18px; bottom: 66px; z-index: 26; display: flex; align-items: flex-end; gap: 6px; max-width: min(430px, calc(100% - 36px)); cursor: pointer; filter: drop-shadow(0 14px 30px rgba(0,0,0,.55)); }
 #mascot[hidden] { display: none !important; }
+body.modal-open #mascot { top: calc(14px + env(safe-area-inset-top, 0px)); bottom: auto; z-index: 31; }
 #mascot.in { animation: mpop .42s cubic-bezier(.2,1.6,.4,1) both; }
 #mascot.out { animation: mout .25s ease-in forwards; }
 @keyframes mpop { from { opacity: 0; transform: translateY(40px) scale(.6); } to { opacity: 1; transform: none; } }
@@ -335,6 +336,11 @@ body.playing #play { overflow: hidden; }
 .objs .peek:hover { color: var(--amber); border-color: var(--amber); }
 .objcmd { display: block; margin-top: 3px; font: 12px var(--f-mono); color: var(--cyan); white-space: pre-wrap; word-break: break-word; }
 .objs li.done .objcmd { color: var(--green); opacity: .85; }
+.asks { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+.askbtn { border: 1px solid var(--line); background: var(--panel2); border-radius: 4px; padding: 5px 9px; font: 500 13px var(--f-body); color: var(--fg); text-align: left; }
+.askbtn:hover:not(:disabled) { border-color: var(--violet); }
+.askbtn.nope { text-decoration: line-through; opacity: .45; }
+.objs li.ask { padding-right: 10px; }
 .hint.fresh { animation: hintpop 1.8s ease-out; }
 @keyframes hintpop { 0%, 30% { background: rgba(255,182,72,.28); box-shadow: 0 0 0 2px var(--amber); } 100% { background: rgba(255,182,72,.07); box-shadow: none; } }
 
@@ -432,6 +438,10 @@ show arp no-resolve
 show lldp neighbors
 show configuration [| display set]
 show log messages
+show interfaces ge-0/0/4 extensive
+monitor interface ge-0/0/4
+show system uptime
+show chassis environment
 ping 8.8.8.8      traceroute 8.8.8.8
 configure
   set ... / delete ... / edit ...
@@ -555,12 +565,14 @@ const RC = (() => {
     count: t => /^\d+$/.test(t) && +t >= 1 && +t <= 20,
     number: t => /^\d+$/.test(t) && +t <= 49,
     minutes: t => /^\d+$/.test(t),
+    mtu: t => /^\d+$/.test(t) && +t >= 256 && +t <= 9216,
   };
   const CFG_TREE = {
     interfaces: {
       '<interface>': {
         description: '<text>',
         disable: null,
+        mtu: '<mtu>',
         unit: {
           '<unit>': {
             family: {
@@ -588,9 +600,10 @@ const RC = (() => {
     static: 'Static routes', route: 'Static route', 'next-hop': 'Next hop to destination', 'host-name': 'Hostname for this router',
     '<interface>': 'Interface name (e.g. ge-0/0/7, irb)', '<unit>': 'Logical unit number', '<vlan-name>': 'VLAN name',
     '<prefix>': 'Destination prefix (x.x.x.x/len)',
+    mtu: 'Maximum transmission unit packet size', '<mtu>': 'MTU in bytes, including the 14-byte Ethernet header (256..9216)',
   };
-  const VALUE_KEYS = new Set(['description', 'members', 'address', 'vlan-id', 'l3-interface', 'host-name', 'next-hop', 'interface-mode']);
-  const SINGLE_VALUED = new Set(['description', 'vlan-id', 'l3-interface', 'host-name', 'interface-mode', 'next-hop']);
+  const VALUE_KEYS = new Set(['description', 'members', 'address', 'vlan-id', 'l3-interface', 'host-name', 'next-hop', 'interface-mode', 'mtu']);
+  const SINGLE_VALUED = new Set(['description', 'vlan-id', 'l3-interface', 'host-name', 'interface-mode', 'next-hop', 'mtu']);
 
   // Walk tokens through a grammar tree. Returns {ok, tokens (expanded), lines:[[tokens]], node, error, errIdx}
   function walkTree(tree, toks, opts = {}) {
@@ -660,6 +673,7 @@ const RC = (() => {
         const i = IF(t[1]);
         if (t[2] === 'disable') i.disable = true;
         else if (t[2] === 'description') i.desc = t.slice(3).join(' ').replace(/"/g, '');
+        else if (t[2] === 'mtu' && t[3]) i.mtu = +t[3];
         else if (t[2] === 'unit' && t[3] !== undefined) {
           const u = i.units[t[3]] || (i.units[t[3]] = { es: null, inet: [] });
           if (t[4] === 'family' && t[5] === 'ethernet-switching') {
@@ -784,9 +798,9 @@ const RC = (() => {
       }
       net.dev[d.id] = o;
     }
-    for (const [a, b] of scn.links) {
+    for (const [a, b, o] of scn.links) {
       const ia = a.indexOf(':'), ib = b.indexOf(':');
-      net.links.push({ a: { dev: a.slice(0, ia), port: a.slice(ia + 1) }, b: { dev: b.slice(0, ib), port: b.slice(ib + 1) }, cut: false });
+      net.links.push({ a: { dev: a.slice(0, ia), port: a.slice(ia + 1) }, b: { dev: b.slice(0, ib), port: b.slice(ib + 1) }, cut: !!(o && o.cut) });
     }
     return net;
   }
@@ -1026,7 +1040,34 @@ const RC = (() => {
     return r ? r.iface.ip : null;
   }
 
-  function ping(net, srcDev, dstStr) {
+  /* ---------- MTU ---------- */
+  const hostMtu = d => (d.nic && d.nic.mtu) || 1500;
+  function portLimit(net, devId, port) {
+    const d = net.dev[devId];
+    const i = d.model.ifaces[port];
+    return ((i && i.mtu) || 1514) - 14; // Junos media MTU includes the Ethernet header
+  }
+  // Largest IP packet that survives this device path, and where the first drop happens.
+  function pathLimit(net, devPath) {
+    let min = Infinity, at = null;
+    for (let k = 0; k + 1 < devPath.length; k++) {
+      const a = devPath[k], b = devPath[k + 1];
+      if (a === b) continue;
+      const l = net.links.find(x => (x.a.dev === a && x.b.dev === b) || (x.a.dev === b && x.b.dev === a));
+      if (!l) continue;
+      const pa = l.a.dev === a ? l.a : l.b, pb = l.a.dev === a ? l.b : l.a;
+      for (const [pp, ingress] of [[pb, true], [pa, false]]) {
+        if (isHost(net.dev[pp.dev])) continue;
+        const m = portLimit(net, pp.dev, pp.port);
+        if (m < min) { min = m; at = { dev: pp.dev, port: pp.port, ingress }; }
+      }
+    }
+    const last = net.dev[devPath[devPath.length - 1]];
+    if (last && isHost(last) && hostMtu(last) < min) { min = hostMtu(last); at = null; }
+    return { mtu: min, at };
+  }
+
+  function ping(net, srcDev, dstStr, opts = {}) {
     const dst = ip2n(dstStr);
     if (dst === null) return { ok: false, reason: 'resolve' };
     const src = sourceIP(net, srcDev, dst);
@@ -1034,6 +1075,16 @@ const RC = (() => {
     const f = forward(net, srcDev, dst);
     if (!f.ok) return { ok: false, reason: f.reason, f, src };
     const r = forward(net, f.last, src);
+    if (r.ok && opts.size) {
+      const pkt = opts.size + 28;
+      const sd = net.dev[srcDev], dd = net.dev[f.last];
+      const srcM = isHost(sd) ? hostMtu(sd) : 1500, dstM = isHost(dd) ? hostMtu(dd) : 1500;
+      if (opts.df && pkt > srcM) return { ok: false, reason: 'local-mtu', f, src };
+      const fw = pathLimit(net, f.devPath), effF = opts.df ? pkt : Math.min(pkt, srcM);
+      if (effF > fw.mtu) return { ok: false, reason: 'mtu', at: fw.at, f, r, src, hops: f.hops.length };
+      const rv = pathLimit(net, r.devPath), effR = opts.df ? pkt : Math.min(pkt, dstM);
+      if (effR > rv.mtu) return { ok: false, reason: 'mtu', at: rv.at, f, r, src, hops: f.hops.length, replyLost: true };
+    }
     return { ok: r.ok, reason: r.ok ? null : 'noreply', f, r, src, hops: f.hops.length };
   }
 
@@ -1048,7 +1099,7 @@ const RC = (() => {
   }
 
   function check(net, c) {
-    return ping(net, c.from, c.to).ok;
+    return ping(net, c.from, c.to, c.size ? { size: c.size, df: true } : {}).ok;
   }
 
   /* ---------- operational data for CLI ---------- */
@@ -1092,7 +1143,7 @@ const RC = (() => {
     ip2n, n2ip, maskN, parseCidr, inSubnet, netAddr, tokenize, walkTree, completions, CFG_TREE, SINGLE_VALUED,
     parseConfig, checkConfig, renderTree, buildNet, commitDevice, peerOf, linkUp, adminUp, portL2, routedAddr,
     segment, hostAddr, l3Ifaces, routeTable, lookup, forward, ping, traceroute, check, macTable, arpTable,
-    vlanIdOf, vlanNameOf, isHost, isNet, configDiff, HELP, VALUE_KEYS, maskN,
+    vlanIdOf, vlanNameOf, isHost, isNet, configDiff, HELP, VALUE_KEYS, maskN, hostMtu, hash,
   };
 })();
 if (typeof module !== 'undefined') module.exports = RC;
@@ -1850,6 +1901,572 @@ const SCENARIOS = [
       ],
     },
   },
+
+  /* ================= JNCIA-aligned · Chapter 1 (continued) ================= */
+  {
+    id: 'D5', kind: 'drill', ticket: 'DRILL 1.5', priority: 'DRILL', sla: null, reward: 150, par: 99,
+    client: 'Ouchi-juku Soba House', title: 'Finding your way around',
+    reporter: 'JNCIA-aligned · Chapter 1',
+    brief: 'The soba house just mounted a tablet in the kitchen for orders. Its port needs a proper description. Junos configuration is a tree. Instead of typing the full path every time, you can climb into a branch, work there, and climb back out.',
+    focus: 'sw',
+    devices: [
+      {
+        id: 'sw', type: 'switch', name: 'ocj-sw1', hw: 'ex2300-c-12p', x: 500, y: 220, ports: ['ge-0/0/1', 'ge-0/0/2', 'ge-0/0/3'],
+        config: `
+          set system host-name ocj-sw1
+          set interfaces ge-0/0/1 description "register"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members SHOP
+          set interfaces ge-0/0/2 description "office pc"
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members SHOP
+          set interfaces ge-0/0/3 description "spare"
+          set interfaces ge-0/0/3 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/3 unit 0 family ethernet-switching vlan members SHOP
+          set interfaces irb unit 10 family inet address 10.61.10.1/24
+          set vlans SHOP vlan-id 10
+          set vlans SHOP l3-interface irb.10`,
+      },
+      { id: 'reg', type: 'pc', name: 'Register', x: 330, y: 430, nic: { dhcp: true, offset: 21 } },
+      { id: 'off', type: 'pc', name: 'Office-PC', x: 500, y: 430, nic: { dhcp: true, offset: 22 } },
+      { id: 'tab', type: 'laptop', name: 'Kitchen-Tablet', x: 670, y: 430, nic: { dhcp: true, offset: 40 } },
+    ],
+    links: [['sw:ge-0/0/1', 'reg:eth0'], ['sw:ge-0/0/2', 'off:eth0'], ['sw:ge-0/0/3', 'tab:eth0']],
+    objectives: [
+      { t: 'In configuration mode, jump into the ge-0/0/3 branch of the tree', cmd: 'edit interfaces ge-0/0/3', test: X => X.ranCfg(/^edit interfaces ge-0\/0\/3$/) },
+      { t: 'From inside that branch, describe the port as "kitchen tablet"', cmd: 'set description "kitchen tablet"', test: X => X.cand('sw', /^set interfaces ge-0\/0\/3 description "kitchen tablet"$/) },
+      { t: 'Look at just this branch of your draft', cmd: 'show', test: X => X.after(X.firstIdx(/^edit interfaces ge-0\/0\/3$/, true), c => c.mode === 'cfg' && c.key === 'show' && !(c.mods && c.mods.compare)) },
+      { t: 'Climb back out to the top of the tree', cmd: 'top  (or up, twice)', test: X => X.idx(/^(top|up|exit)$/, true) > X.firstIdx(/^edit interfaces ge-0\/0\/3$/, true) && X.firstIdx(/^edit interfaces ge-0\/0\/3$/, true) >= 0 },
+      { t: 'Preview, then commit', cmd: 'show | compare, then commit', test: X => X.compared() && X.has('sw', 'set interfaces ge-0/0/3 description "kitchen tablet"') },
+    ],
+    hints: [
+      'configure, then edit interfaces ge-0/0/3. Watch the [edit ...] line above the prompt change.',
+      'Inside [edit interfaces ge-0/0/3], commands are relative: set description "kitchen tablet". Then plain show shows only this branch.',
+      'top jumps back to [edit]. Then show | compare and commit.',
+    ],
+    debrief: [
+      'The [edit ...] banner always tells you where you are in the tree. Every set, delete and show is relative to that spot.',
+      'edit saves a lot of typing when you change several things on one interface: description, unit, VLAN, all from one place.',
+      'up climbs one level, top goes straight to the root, and exit climbs one level (or leaves configuration mode from the top).',
+      'In operational mode, edit is also a shortcut for configure. Same command, different job, depending on the prompt.',
+    ],
+  },
+
+  {
+    id: 'D6', kind: 'drill', ticket: 'DRILL 1.6', priority: 'DRILL', sla: null, reward: 150, par: 99,
+    client: 'Magome Inn', title: 'Pipes and filters',
+    reporter: 'JNCIA-aligned · Chapter 1',
+    brief: 'The inn wants to know which rooms get guest Wi-Fi. Real configs run for thousands of lines, and nobody scrolls through all of them. The pipe ( | ) lets you reshape and filter any output.',
+    focus: 'sw',
+    devices: [
+      {
+        id: 'sw', type: 'switch', name: 'mgm-sw1', hw: 'ex2300-24p', x: 500, y: 220,
+        ports: ['ge-0/0/1', 'ge-0/0/2', 'ge-0/0/3', 'ge-0/0/4', 'ge-0/0/5', 'ge-0/0/6', 'ge-0/0/7', 'ge-0/0/8'],
+        config: `
+          set system host-name mgm-sw1
+          set interfaces ge-0/0/1 description "front desk"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members STAFF
+          set interfaces ge-0/0/2 description "back office"
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members STAFF
+          set interfaces ge-0/0/3 description "kitchen"
+          set interfaces ge-0/0/3 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/3 unit 0 family ethernet-switching vlan members STAFF
+          set interfaces ge-0/0/4 description "ap - east wing"
+          set interfaces ge-0/0/4 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/4 unit 0 family ethernet-switching vlan members GUESTS
+          set interfaces ge-0/0/5 description "ap - west wing"
+          set interfaces ge-0/0/5 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/5 unit 0 family ethernet-switching vlan members GUESTS
+          set interfaces ge-0/0/6 description "ap - onsen lounge"
+          set interfaces ge-0/0/6 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/6 unit 0 family ethernet-switching vlan members GUESTS
+          set interfaces ge-0/0/7 description "camera - gate"
+          set interfaces ge-0/0/7 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/7 unit 0 family ethernet-switching vlan members CAMS
+          set interfaces ge-0/0/8 description "camera - parking"
+          set interfaces ge-0/0/8 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/8 unit 0 family ethernet-switching vlan members CAMS
+          set interfaces irb unit 10 family inet address 10.62.10.1/24
+          set interfaces irb unit 30 family inet address 10.62.30.1/24
+          set interfaces irb unit 40 family inet address 10.62.40.1/24
+          set vlans STAFF vlan-id 10
+          set vlans STAFF l3-interface irb.10
+          set vlans GUESTS vlan-id 30
+          set vlans GUESTS l3-interface irb.30
+          set vlans CAMS vlan-id 40
+          set vlans CAMS l3-interface irb.40`,
+      },
+      { id: 'desk', type: 'pc', name: 'FrontDesk-PC', x: 300, y: 430, nic: { dhcp: true, offset: 21 } },
+      { id: 'ap', type: 'laptop', name: 'Guest-Laptop', x: 500, y: 430, nic: { dhcp: true, offset: 120 } },
+      { id: 'cam', type: 'camera', name: 'gate-cam', x: 700, y: 430, nic: { ip: '10.62.40.20/24', gw: '10.62.40.1' } },
+    ],
+    links: [['sw:ge-0/0/1', 'desk:eth0'], ['sw:ge-0/0/4', 'ap:eth0'], ['sw:ge-0/0/7', 'cam:eth0']],
+    objectives: [
+      { t: 'Show the whole configuration as one-line set commands', cmd: 'show configuration | display set', test: X => X.ranMods(/^show configuration/, m => m.displaySet) },
+      { t: 'Filter that down to only the lines that mention GUESTS', cmd: 'show configuration | display set | match GUESTS', test: X => X.ranMods(/^show configuration/, m => m.displaySet && m.filters.some(f => f[0] === 'match' && /guests/i.test(f[1]))) },
+      { t: 'How many ports are in the GUESTS VLAN?', ask: ['2', '3', '4', '6'], ok: 1 },
+      { t: 'Show the set commands again, but hide every description line', cmd: 'show configuration | display set | except description', test: X => X.ranMods(/^show configuration/, m => m.filters.some(f => f[0] === 'except' && /desc/i.test(f[1]))) },
+      { t: 'Count how many lines the full set-style config has', cmd: 'show configuration | display set | count', test: X => X.ranMods(/^show configuration/, m => m.filters.some(f => f[0] === 'count')) },
+    ],
+    hints: [
+      'show configuration | display set prints every statement as a full set command, one per line. Easy to search, easy to copy.',
+      'Stack pipes: show configuration | display set | match GUESTS. Count the interface lines, not the vlans lines.',
+      'except is the opposite of match: | except description. And | count tells you how many lines are left.',
+    ],
+    debrief: [
+      'display set is the format most engineers paste into tickets and change plans. Every line stands on its own.',
+      'match and except take patterns, so | match "ge-0/0/[4-6]" works. Pipes stack left to right.',
+      'Pipes work on almost every show command, not just configuration: show interfaces terse | match down, show log messages | match LINK.',
+      'The GUESTS VLAN had three ports, all access points. The vlans lines also matched, which is exactly why you count with care.',
+    ],
+  },
+
+  {
+    id: 'D7', kind: 'drill', ticket: 'DRILL 1.7', priority: 'DRILL', sla: null, reward: 150, par: 99,
+    client: 'Tsumago Post Office', title: 'Check before you commit',
+    reporter: 'JNCIA-aligned · Chapter 1',
+    brief: 'Desk 4 moved from public counter duty to the staff side. Its port needs to move from the GUEST VLAN to STAFF. commit check tests your draft without applying it, and a commit comment tells the next engineer why you did it.',
+    focus: 'sw',
+    villain: 'Just add STAFF and commit. What could go wrong? Heh heh.',
+    devices: [
+      {
+        id: 'sw', type: 'switch', name: 'tsg-sw1', hw: 'ex2300-c-12p', x: 500, y: 220, ports: ['ge-0/0/1', 'ge-0/0/4'],
+        config: `
+          set system host-name tsg-sw1
+          set interfaces ge-0/0/1 description "clerk"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members STAFF
+          set interfaces ge-0/0/4 description "desk 4"
+          set interfaces ge-0/0/4 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/4 unit 0 family ethernet-switching vlan members GUEST
+          set interfaces irb unit 10 family inet address 10.63.10.1/24
+          set interfaces irb unit 20 family inet address 10.63.20.1/24
+          set vlans STAFF vlan-id 10
+          set vlans STAFF l3-interface irb.10
+          set vlans GUEST vlan-id 20
+          set vlans GUEST l3-interface irb.20`,
+      },
+      { id: 'clerk', type: 'pc', name: 'Clerk-PC', x: 380, y: 430, nic: { dhcp: true, offset: 21 } },
+      { id: 'desk4', type: 'pc', name: 'Desk4-PC', x: 620, y: 430, nic: { dhcp: true, offset: 44 } },
+    ],
+    links: [['sw:ge-0/0/1', 'clerk:eth0'], ['sw:ge-0/0/4', 'desk4:eth0']],
+    objectives: [
+      { t: 'Add the STAFF VLAN to ge-0/0/4 (leave GUEST alone for now)', cmd: 'set interfaces ge-0/0/4 unit 0 family ethernet-switching vlan members STAFF', test: X => X.cand('sw', /^set interfaces ge-0\/0\/4 unit 0 family ethernet-switching vlan members STAFF$/) },
+      { t: 'Test your draft without applying it', cmd: 'commit check', test: X => X.ev('checkfail', 'sw') || X.ev('check', 'sw') },
+      { t: 'What did the check complain about?', ask: ['An access port can belong to only one VLAN', 'The STAFF VLAN does not exist', 'The port is disabled', 'Nothing, it passed'], ok: 0 },
+      { t: 'Remove GUEST from the port, then check again until it passes', cmd: 'delete interfaces ge-0/0/4 unit 0 family ethernet-switching vlan members GUEST, then commit check', test: X => X.ev('check', 'sw') && !(X.d('sw').candidate || []).includes('set interfaces ge-0/0/4 unit 0 family ethernet-switching vlan members GUEST') },
+      { t: 'Commit with a comment explaining why', cmd: 'commit comment "desk 4 moved to staff"', test: X => X.d('sw').commitLog.some(c => c.user === 'noc' && c.comment) && X.has('sw', 'set interfaces ge-0/0/4 unit 0 family ethernet-switching vlan members STAFF') },
+      { t: 'Find your comment in the commit history', cmd: 'show system commit  (run show system commit from configuration mode)', test: X => X.d('sw').commitLog.some(c => c.user === 'noc' && c.comment) && X.idx(/^show system commit/) > X.idx(/^commit/, true) },
+    ],
+    hints: [
+      'set interfaces ge-0/0/4 unit 0 family ethernet-switching vlan members STAFF adds a member. It does not replace the old one.',
+      'commit check runs every validation a real commit would, then stops. Read what it says about access interfaces.',
+      'delete ... vlan members GUEST, commit check again, then commit comment "desk 4 moved to staff". Finish with run show system commit.',
+    ],
+    debrief: [
+      'set adds; it never replaces a list. Moving a port between VLANs is always a delete plus a set.',
+      'commit check caught the mistake before it touched the switch. A plain commit would have refused too, but check lets you test without any risk of a partial surprise.',
+      'commit comment writes your reason into show system commit. Six months from now, "desk 4 moved to staff" beats a blank line.',
+      'Shortcut worth knowing: in configuration mode, run <command> lets you use any operational command without leaving.',
+    ],
+  },
+
+  {
+    id: 'D8', kind: 'drill', ticket: 'DRILL 1.8', priority: 'DRILL', sla: null, reward: 150, par: 99,
+    client: 'Shirakawa-go Farmhouse', title: 'Changed my mind',
+    reporter: 'JNCIA-aligned · Chapter 1',
+    brief: 'You started some changes on the farmhouse switch, then the owner called: hold everything until spring. Your candidate config is just a draft. Throw it away cleanly and leave the running config exactly as it was.',
+    focus: 'sw',
+    villain: 'Leave a half-finished draft behind. The next engineer will LOVE committing your surprises.',
+    devices: [
+      {
+        id: 'sw', type: 'switch', name: 'skw-sw1', hw: 'ex2300-c-12p', x: 500, y: 220, ports: ['ge-0/0/1', 'ge-0/0/2'],
+        config: `
+          set system host-name skw-sw1
+          set interfaces ge-0/0/1 description "house pc"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members FARM
+          set interfaces ge-0/0/2 description "barn camera"
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members FARM
+          set interfaces irb unit 10 family inet address 10.64.10.1/24
+          set vlans FARM vlan-id 10
+          set vlans FARM l3-interface irb.10`,
+      },
+      { id: 'pc', type: 'pc', name: 'House-PC', x: 380, y: 430, nic: { dhcp: true, offset: 21 } },
+      { id: 'cam', type: 'camera', name: 'barn-cam', x: 620, y: 430, nic: { ip: '10.64.10.30/24', gw: '10.64.10.1' } },
+    ],
+    links: [['sw:ge-0/0/1', 'pc:eth0'], ['sw:ge-0/0/2', 'cam:eth0']],
+    objectives: [
+      { t: 'Start two changes: disable ge-0/0/2 and rename the switch skw-sw9', cmd: 'set interfaces ge-0/0/2 disable  and  set system host-name skw-sw9', test: X => X.cand('sw', /^set interfaces ge-0\/0\/2 disable$/) && X.cand('sw', /^set system host-name skw-sw9$/) },
+      { t: 'Review your uncommitted changes', cmd: 'show | compare', test: X => X.compared() },
+      { t: 'Throw away every uncommitted change', cmd: 'rollback 0  (or plain rollback)', test: X => X.ranCfg(/^rollback( 0)?$/) && X.same(X.d('sw').candidate, X.d('sw').committed) },
+      { t: 'Prove there is nothing left to commit', cmd: 'show | compare  (it should print nothing)', test: X => X.after(X.idx(/^rollback( 0)?$/, true), c => c.mods && c.mods.compare) && X.same(X.d('sw').candidate, X.d('sw').committed) },
+      { t: 'Leave configuration mode with the running config untouched', cmd: 'exit', test: X => X.idx(/^exit( configuration-mode)?$/, true) > X.idx(/^rollback( 0)?$/, true) && X.idx(/^rollback( 0)?$/, true) >= 0 && X.same(X.d('sw').committed, X.d('sw').original) },
+    ],
+    hints: [
+      'configure, then set interfaces ge-0/0/2 disable and set system host-name skw-sw9. Do not commit.',
+      'show | compare lists your draft changes. rollback 0 (or just rollback) reloads the running config into your draft.',
+      'show | compare again prints nothing when the draft matches what is running. Then exit.',
+    ],
+    debrief: [
+      'rollback 0 means "the config that is running right now." Loading it over your draft discards every uncommitted change in one move.',
+      'An empty show | compare is how you prove it. No output means nothing would change.',
+      'Junos keeps one shared candidate. If you exit with uncommitted changes, the next person to type configure inherits them, along with a warning. Always leave it clean.',
+    ],
+  },
+
+  /* ================= JNCIA-aligned · Chapter 2: Operational monitoring ================= */
+  {
+    id: 'D21', kind: 'drill', ticket: 'DRILL 2.1', priority: 'DRILL', sla: null, reward: 175, par: 99,
+    client: 'Gujo Hachiman Folk Museum', title: 'Know your box',
+    reporter: 'JNCIA-aligned · Chapter 2',
+    brief: 'The museum says their switch closet "sounds different" lately. Before touching any config, get to know the hardware: what it is, how long it has been up, and how healthy it is.',
+    focus: 'sw',
+    devices: [
+      {
+        id: 'sw', type: 'switch', name: 'gjm-sw1', hw: 'ex2300-24p', x: 500, y: 220, ports: ['ge-0/0/1', 'ge-0/0/2'], uptimeDays: 112,
+        env: [['Power', 'FPC 0 Power Supply 0', 'OK', ''], ['Temp', 'FPC 0 CPU Sensor', 'OK', '58 degrees C / 136 degrees F'],
+          ['Temp', 'FPC 0 Fan Tray 0 Sensor', 'OK', '49 degrees C / 120 degrees F'], ['Fans', 'FPC 0 Fan Tray 0 Fan 0', 'OK', 'Spinning at high speed'],
+          ['Fans', 'FPC 0 Fan Tray 0 Fan 1', 'Failed', 'Not spinning']],
+        alarms: [{ cls: 'Major', text: 'FPC 0 Fan Tray 0 Fan 1 Failure' }],
+        config: `
+          set system host-name gjm-sw1
+          set interfaces ge-0/0/1 description "exhibit kiosk"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members MUSEUM
+          set interfaces ge-0/0/2 description "ticket desk"
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members MUSEUM
+          set interfaces irb unit 10 family inet address 10.71.10.1/24
+          set vlans MUSEUM vlan-id 10
+          set vlans MUSEUM l3-interface irb.10`,
+      },
+      { id: 'kiosk', type: 'pc', name: 'Kiosk', x: 380, y: 430, nic: { dhcp: true, offset: 31 } },
+      { id: 'desk', type: 'pc', name: 'Ticket-PC', x: 620, y: 430, nic: { dhcp: true, offset: 32 } },
+    ],
+    links: [['sw:ge-0/0/1', 'kiosk:eth0'], ['sw:ge-0/0/2', 'desk:eth0']],
+    objectives: [
+      { t: 'Confirm the model and Junos version', cmd: 'show version', test: X => X.ran(/^show version/) },
+      { t: 'Find out how long the switch has been running', cmd: 'show system uptime', test: X => X.ran(/^show system uptime/) },
+      { t: 'Check power, temperatures and fans', cmd: 'show chassis environment', test: X => X.ran(/^show chassis environment/) },
+      { t: 'Which part needs attention?', ask: ['Power supply 0', 'Fan tray 0, fan 1', 'The CPU sensor', 'Nothing, everything is OK'], ok: 1 },
+      { t: 'See whether Junos raised an alarm about it', cmd: 'show chassis alarms', test: X => X.ran(/^show chassis alarms/) },
+    ],
+    hints: [
+      'show version, then show system uptime. Uptime tells you whether a reboot could explain anything.',
+      'show chassis environment lists every power supply, temperature sensor and fan with a status column. Look for anything that is not OK.',
+      'show chassis alarms shows what Junos itself is complaining about. Rescue config alarms are a minor nag; hardware ones matter.',
+    ],
+    debrief: [
+      'One fan had failed, and the other was spinning at high speed to compensate. That is the "sounds different" the museum heard.',
+      'The CPU was running warmer than normal because of it. Left alone, heat is how a fan failure becomes an outage.',
+      'Real fix: a replacement fan tray (they are field-replaceable on many EX models). Your job today was to notice it before it got worse.',
+      'Uptime of 112 days also told you this was not a recent reboot problem. Good first questions: what is it, how long has it been up, is it healthy?',
+    ],
+  },
+
+  {
+    id: 'D22', kind: 'drill', ticket: 'DRILL 2.2', priority: 'DRILL', sla: null, reward: 175, par: 99,
+    client: 'Nozawa Onsen Lodge', title: 'Interfaces at a glance',
+    reporter: 'JNCIA-aligned · Chapter 2',
+    brief: 'The lodge says the front desk PC is "offline" and asks if someone turned it off. Good port descriptions plus a quick filtered view answer that in seconds, without touching anything.',
+    focus: 'sw',
+    devices: [
+      {
+        id: 'sw', type: 'switch', name: 'nzo-sw1', hw: 'ex2300-24p', x: 500, y: 220, ports: ['ge-0/0/1', 'ge-0/0/2', 'ge-0/0/5', 'ge-0/0/6', 'ge-0/0/9', 'ge-0/0/10'],
+        config: `
+          set system host-name nzo-sw1
+          set interfaces ge-0/0/1 description "office pc"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members LODGE
+          set interfaces ge-0/0/2 description "printer"
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members LODGE
+          set interfaces ge-0/0/5 description "front desk"
+          set interfaces ge-0/0/5 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/5 unit 0 family ethernet-switching vlan members LODGE
+          set interfaces ge-0/0/6 description "ski rental kiosk"
+          set interfaces ge-0/0/6 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/6 unit 0 family ethernet-switching vlan members LODGE
+          set interfaces ge-0/0/9 description "spare - lobby jack"
+          set interfaces ge-0/0/9 disable
+          set interfaces ge-0/0/9 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/10 unit 0 family ethernet-switching interface-mode access
+          set interfaces irb unit 10 family inet address 10.72.10.1/24
+          set vlans LODGE vlan-id 10
+          set vlans LODGE l3-interface irb.10`,
+      },
+      { id: 'pc', type: 'pc', name: 'Office-PC', x: 260, y: 430, nic: { dhcp: true, offset: 21 } },
+      { id: 'prn', type: 'printer', name: 'printer', x: 420, y: 430, nic: { ip: '10.72.10.20/24', gw: '10.72.10.1' } },
+      { id: 'desk', type: 'pc', name: 'FrontDesk-PC', x: 580, y: 430, nic: { dhcp: true, offset: 25 } },
+      { id: 'kiosk', type: 'laptop', name: 'Ski-Kiosk', x: 740, y: 430, nic: { dhcp: true, offset: 26 } },
+    ],
+    links: [['sw:ge-0/0/1', 'pc:eth0'], ['sw:ge-0/0/2', 'prn:eth0'], ['sw:ge-0/0/5', 'desk:eth0', { cut: true }], ['sw:ge-0/0/6', 'kiosk:eth0']],
+    objectives: [
+      { t: 'List every port that has a description', cmd: 'show interfaces descriptions', test: X => X.ran(/^show interfaces descriptions/) },
+      { t: 'Show only the interfaces that are down', cmd: 'show interfaces terse | match down', test: X => X.ranMods(/^show interfaces/, m => m.filters.some(f => f[0] === 'match' && /down/i.test(f[1]))) },
+      { t: 'What does the switch say about the front desk port?', ask: ['Admin down: someone disabled it', 'Link down: no signal on the cable', 'Up and up: the problem is somewhere else', 'It has no description'], ok: 1 },
+      { t: 'Which port was disabled on purpose?', ask: ['ge-0/0/5 (front desk)', 'ge-0/0/9 (spare - lobby jack)', 'ge-0/0/10 (no description)', 'None of them'], ok: 1 },
+    ],
+    hints: [
+      'show interfaces descriptions lists only described ports, with Admin and Link columns side by side.',
+      'show interfaces terse | match down keeps only lines with "down" in them. Then read the Admin and Link columns separately.',
+      'Admin down = configured with disable. Link down with admin up = nothing on the other end of the cable (unplugged, bad cable, device off).',
+    ],
+    debrief: [
+      'The front desk port was admin up, link down. Nobody turned it off. The cable or the PC end is the problem, so the fix is a walk to the front desk, not a config change.',
+      'ge-0/0/9 was admin down on purpose: an unused lobby jack, disabled so strangers cannot plug in. That is good hygiene.',
+      'ge-0/0/10 had no description, so it never showed in the descriptions list. Undescribed ports are invisible in the views people actually use. Describe everything.',
+    ],
+  },
+
+  {
+    id: 'D23', kind: 'drill', ticket: 'DRILL 2.3', priority: 'DRILL', sla: null, reward: 175, par: 99,
+    client: 'Takayama Sake Brewery', title: 'Counters tell stories',
+    reporter: 'JNCIA-aligned · Chapter 2',
+    brief: 'The brewery\'s label printer drops jobs a few times a day. Interface counters remember everything since they were last cleared. The trick is telling old history from a problem that is happening right now.',
+    focus: 'sw',
+    grow: () => ({ sw: { 'ge-0/0/4': { crc: 6 } } }),
+    devices: [
+      {
+        id: 'sw', type: 'switch', name: 'tsb-sw1', hw: 'ex2300-c-12p', x: 500, y: 220, ports: ['ge-0/0/1', 'ge-0/0/2', 'ge-0/0/4'],
+        counters: { 'ge-0/0/4': { crc: 18342, carrier: 3 } },
+        config: `
+          set system host-name tsb-sw1
+          set interfaces ge-0/0/1 description "office pc"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members BREWERY
+          set interfaces ge-0/0/2 description "tank monitor"
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members BREWERY
+          set interfaces ge-0/0/4 description "label printer - bottling line"
+          set interfaces ge-0/0/4 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/4 unit 0 family ethernet-switching vlan members BREWERY
+          set interfaces irb unit 10 family inet address 10.73.10.1/24
+          set vlans BREWERY vlan-id 10
+          set vlans BREWERY l3-interface irb.10`,
+      },
+      { id: 'pc', type: 'pc', name: 'Office-PC', x: 330, y: 430, nic: { dhcp: true, offset: 21 } },
+      { id: 'tank', type: 'pc', name: 'Tank-Monitor', x: 500, y: 430, nic: { ip: '10.73.10.40/24', gw: '10.73.10.1' } },
+      { id: 'lbl', type: 'printer', name: 'label-printer', x: 670, y: 430, nic: { ip: '10.73.10.50/24', gw: '10.73.10.1' } },
+    ],
+    links: [['sw:ge-0/0/1', 'pc:eth0'], ['sw:ge-0/0/2', 'tank:eth0'], ['sw:ge-0/0/4', 'lbl:eth0']],
+    objectives: [
+      { t: 'Look at the label printer port in full detail', cmd: 'show interfaces ge-0/0/4 extensive', test: X => X.ran(/^show interfaces ge-0\/0\/4 extensive/) },
+      { t: 'Which counter stands out?', ask: ['CRC/Align errors', 'Oversized frames', 'Output drops', 'Nothing, all zeros'], ok: 0 },
+      { t: 'Reset the counters on that port, so you only see new errors', cmd: 'clear interfaces statistics ge-0/0/4', test: X => X.ev('clear', 'sw') },
+      { t: 'Watch the port live for a few seconds', cmd: 'monitor interface ge-0/0/4', test: X => X.idx(/^monitor interface ge-0\/0\/4/) > X.idx(/^clear interfaces statistics/) && X.idx(/^clear interfaces statistics/) >= 0 },
+      { t: 'Are the errors still happening right now?', ask: ['Yes, they are still climbing', 'No, they stopped after the clear'], ok: 0 },
+    ],
+    hints: [
+      'show interfaces ge-0/0/4 extensive. Look at the Input errors block and the MAC statistics table.',
+      'Thousands of CRC errors could be from last month. clear interfaces statistics ge-0/0/4 zeroes them without touching the config.',
+      'monitor interface ge-0/0/4 refreshes every second. If CRC/Align keeps going up after a clear, the problem is live.',
+    ],
+    debrief: [
+      'CRC errors mean frames arrived damaged. That is layer 1: a bad cable, a bad jack, a failing NIC, or a speed/duplex mismatch.',
+      'Counters are cumulative since the last clear (or reboot). 18,000 errors told you there was a problem once. Clearing and watching proved it is still happening.',
+      'Clearing statistics never changes the configuration. It is safe, and it is the fastest way to tell history from a live problem.',
+      'Next step in real life: swap the patch cable at the bottling line. Damp, vibrating factory floors are hard on copper.',
+    ],
+  },
+
+  {
+    id: 'D24', kind: 'drill', ticket: 'DRILL 2.4', priority: 'DRILL', sla: null, reward: 175, par: 99,
+    client: 'Kumano Kodo Guesthouse', title: 'Logs that matter',
+    reporter: 'JNCIA-aligned · Chapter 2',
+    brief: 'Pilgrims say the guesthouse Wi-Fi "drops for a minute" now and then. The access point hangs off ge-0/0/6. The system log has the story, buried in noise. Filter it.',
+    focus: 'sw',
+    devices: [
+      {
+        id: 'sw', type: 'switch', name: 'kmn-sw1', hw: 'ex2300-c-12p', x: 500, y: 220, ports: ['ge-0/0/1', 'ge-0/0/2', 'ge-0/0/6'],
+        config: `
+          set system host-name kmn-sw1
+          set interfaces ge-0/0/1 description "office pc"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members INN
+          set interfaces ge-0/0/2 description "printer"
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members INN
+          set interfaces ge-0/0/6 description "ap - common room"
+          set interfaces ge-0/0/6 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/6 unit 0 family ethernet-switching vlan members INN
+          set interfaces irb unit 10 family inet address 10.74.10.1/24
+          set vlans INN vlan-id 10
+          set vlans INN l3-interface irb.10`,
+        logs: `
+          Oct 19 00:00:01  kmn-sw1 cron[2101]: (root) CMD (newsyslog)
+          Oct 19 06:12:44  kmn-sw1 chassisd[1288]: CHASSISD_POE_POWER_USAGE: PoE power usage at 44% of budget
+          Oct 19 07:31:09  kmn-sw1 mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 518, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/6
+          Oct 19 07:32:15  kmn-sw1 mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 518, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/6
+          Oct 19 08:02:31  kmn-sw1 sshd[4410]: Accepted password for noc from 10.74.10.21 port 51544 ssh2
+          Oct 19 09:47:52  kmn-sw1 mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 514, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/2
+          Oct 19 09:48:03  kmn-sw1 mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 514, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/2
+          Oct 19 12:05:40  kmn-sw1 mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 518, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/6
+          Oct 19 12:06:47  kmn-sw1 mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 518, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/6
+          Oct 19 12:06:49  kmn-sw1 chassisd[1288]: CHASSISD_POE_POWER_USAGE: PoE power usage at 71% of budget
+          Oct 19 15:22:13  kmn-sw1 mgd[4410]: UI_LOGIN_EVENT: User 'noc' login, class 'j-super-user'
+          Oct 19 18:40:02  kmn-sw1 mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 518, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/6
+          Oct 19 18:41:10  kmn-sw1 mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 518, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/6
+          Oct 19 18:41:12  kmn-sw1 chassisd[1288]: CHASSISD_POE_POWER_USAGE: PoE power usage at 72% of budget
+          Oct 19 21:00:00  kmn-sw1 cron[2101]: (root) CMD (/usr/libexec/atrun)
+          Oct 20 06:55:31  kmn-sw1 mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 518, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/6
+          Oct 20 06:56:38  kmn-sw1 mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 518, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/6
+          Oct 20 06:56:40  kmn-sw1 chassisd[1288]: CHASSISD_POE_POWER_USAGE: PoE power usage at 70% of budget`,
+      },
+      { id: 'pc', type: 'pc', name: 'Office-PC', x: 330, y: 430, nic: { dhcp: true, offset: 21 } },
+      { id: 'prn', type: 'printer', name: 'printer', x: 500, y: 430, nic: { ip: '10.74.10.20/24', gw: '10.74.10.1' } },
+      { id: 'ap', type: 'laptop', name: 'Common-Room-AP', x: 670, y: 430, nic: { ip: '10.74.10.60/24', gw: '10.74.10.1' } },
+    ],
+    links: [['sw:ge-0/0/1', 'pc:eth0'], ['sw:ge-0/0/2', 'prn:eth0'], ['sw:ge-0/0/6', 'ap:eth0']],
+    objectives: [
+      { t: 'Read the system log', cmd: 'show log messages', test: X => X.ran(/^show log messages/) },
+      { t: 'Show only the link up/down events', cmd: 'show log messages | match LINK', test: X => X.ranMods(/^show log/, m => m.filters.some(f => f[0] === 'match' && /link/i.test(f[1]))) },
+      { t: 'Count how many times ge-0/0/6 went DOWN', cmd: 'show log messages | match "LINK_DOWN.*ge-0/0/6" | count', test: X => X.ranMods(/^show log/, m => m.filters.some(f => f[0] === 'count') && m.filters.some(f => f[0] === 'match' && /0\/6/.test(f[1]))) },
+      { t: 'How many times did ge-0/0/6 go down?', ask: ['2', '4', '8', '12'], ok: 1 },
+      { t: 'What else shows up right after the access point comes back?', ask: ['A user logging in', 'PoE power usage jumping', 'A configuration commit', 'Nothing'], ok: 1 },
+    ],
+    hints: [
+      'show log messages | match LINK keeps only link events. Notice ge-0/0/2 flapped once too, so be specific.',
+      'match takes a pattern: | match "LINK_DOWN.*ge-0/0/6" | count. Matching just ge-0/0/6 counts the UP lines too.',
+      'Look at the line right after each LINK_UP for ge-0/0/6. Something about power.',
+    ],
+    debrief: [
+      'ge-0/0/6 dropped four times, about a minute each. That is the "drops for a minute" the pilgrims noticed. Matching only ge-0/0/6 would have given 8, because every drop has a matching UP.',
+      'Each time the AP came back, PoE usage jumped back to about 70%. The AP is losing power and rebooting, not losing signal.',
+      'Likely causes: the switch PoE budget, a marginal injector, or a cable run too long for PoE. A good next step is show poe interface, coming to the simulator later.',
+      'Logs are the one place that remembers time. Counters tell you how much; logs tell you when, and what else happened at the same moment.',
+    ],
+  },
+
+  {
+    id: 'C2T1', ticket: 'TKT-1131', priority: 'P2', sla: 25, reward: 750, par: 2,
+    client: 'Gokayama Woodworks', title: 'Backups stall every night',
+    reporter: 'Owner, Gokayama Woodworks',
+    brief: 'Nightly backups from backup01 to nas01 have failed three nights running. The job starts, then stalls at 0 KB/s and times out. Small files copy fine, and the design team opens projects on nas01 all day without trouble. Last Wednesday a vendor "tuned" both servers.',
+    quotes: [
+      ['Owner', 'If backups are not working by tonight, I am going back to USB drives.'],
+      ['Vendor (email)', 'We applied our standard performance profile to both servers: jumbo frames, offloads, the works. Your network should handle it.'],
+      ['Designer', 'The NAS is as fast as ever for me.'],
+    ],
+    focus: 'backup',
+    villain: 'Big frames, tiny ports. I adore a vendor with a "performance profile." Heh heh.',
+    grow: net => {
+      const m = p => (net.dev.sw.model.ifaces[p] && net.dev.sw.model.ifaces[p].mtu) || 1514;
+      return { sw: { 'ge-0/0/2': { oversize: m('ge-0/0/2') < 9014 ? 40 : 0, pps: 900 }, 'ge-0/0/1': { oversize: m('ge-0/0/1') < 9014 ? 3 : 0, pps: 400 } } };
+    },
+    heat: {
+      devs: { sw: 2, backup: 1, nas: 1, fw: -2, cad: -1, office: -1 },
+      clues: [
+        { dev: ['backup', 'nas'], re: /^ping .*(-l|size)\s*\d{4}/, h: 3, say: ['Small packets yes, big packets no. Interesting...', 'Big ones die. Who in between can\'t take them?'] },
+        { dev: ['backup', 'nas'], re: /^ping/, h: 1, say: ['Small pings work fine. What about BIG ones?'] },
+        { dev: ['backup', 'nas'], re: /^netsh/, h: 3, say: ['9000? That\'s a jumbo frame. Is every port in between ready for it?'] },
+        { dev: ['backup', 'nas'], re: /^ipconfig/, h: 1, say: ['Addresses look right. It ain\'t an IP problem.'] },
+        { dev: 'sw', re: /^(show interfaces ge-0\/0\/[12] extensive|monitor interface ge-0\/0\/[12])/, h: 3, say: ['Oversized frames! Somebody\'s sending more than this port will take.'] },
+        { dev: 'sw', re: /^show interfaces ge-0\/0\/[12]$/, h: 2, say: ['Look at that MTU line. Now look at the extensive counters.'] },
+        { dev: 'sw', re: /^set interfaces ge-0\/0\/[12] mtu/, h: 3, say: ['Every port on the path, remember. Then commit.'] },
+        { dev: 'sw', re: /^ping .*size/, h: 2 },
+        { dev: 'sw', re: /^show log/, h: -1, say: ['The log is quiet. Drops like this don\'t write home.'] },
+        { dev: 'sw', re: /^show (vlans|ethernet-switching|route|arp|lldp)/, h: -1, say: ['Layer 2 and 3 look fine. Think about SIZE.'] },
+        { dev: 'sw', re: /^show configuration/, h: 1 },
+        { dev: 'fw', re: /./, h: -2, say: ['Backups never leave the building. The firewall\'s not involved.'] },
+      ],
+    },
+    devices: [
+      ISP_CLOUD(),
+      {
+        id: 'fw', type: 'firewall', name: 'gkw-fw', hw: 'srx300', x: 500, y: 160, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name gkw-fw
+          set interfaces ge-0/0/0 description "ISP uplink"
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.2/30
+          set interfaces ge-0/0/1 description "to gkw-sw1"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.0.255.1/30
+          set routing-options static route 0.0.0.0/0 next-hop 203.0.113.1
+          set routing-options static route 10.55.0.0/16 next-hop 10.0.255.2`,
+        logs: `
+          Oct 20 02:00:11  gkw-fw RT_FLOW: RT_FLOW_SESSION_CREATE: session created 10.55.10.31/50118->52.96.166.130/443 junos-https`,
+      },
+      {
+        id: 'sw', type: 'switch', name: 'gkw-sw1', hw: 'ex2300-24p', x: 500, y: 300, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2', 'ge-0/0/3', 'ge-0/0/4'],
+        counters: { 'ge-0/0/2': { oversize: 48213 }, 'ge-0/0/1': { oversize: 1290 } },
+        config: `
+          set system host-name gkw-sw1
+          set interfaces ge-0/0/0 description "uplink to gkw-fw"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.0.255.2/30
+          set interfaces ge-0/0/1 description "nas01"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members SERVERS
+          set interfaces ge-0/0/2 description "backup01"
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members SERVERS
+          set interfaces ge-0/0/3 description "cad workstation"
+          set interfaces ge-0/0/3 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/3 unit 0 family ethernet-switching vlan members OFFICE
+          set interfaces ge-0/0/4 description "office pc"
+          set interfaces ge-0/0/4 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/4 unit 0 family ethernet-switching vlan members OFFICE
+          set interfaces irb unit 10 family inet address 10.55.10.1/24
+          set interfaces irb unit 20 family inet address 10.55.20.1/24
+          set vlans OFFICE vlan-id 10
+          set vlans OFFICE l3-interface irb.10
+          set vlans SERVERS vlan-id 20
+          set vlans SERVERS l3-interface irb.20
+          set routing-options static route 0.0.0.0/0 next-hop 10.0.255.1`,
+        logs: `
+          Oct 15 10:41:07  gkw-sw1 mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 514, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/2
+          Oct 15 10:42:55  gkw-sw1 mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 514, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/2
+          Oct 15 10:58:31  gkw-sw1 mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 513, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/1
+          Oct 15 11:00:12  gkw-sw1 mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 513, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/1
+          Oct 18 07:12:44  gkw-sw1 chassisd[1288]: CHASSISD_POE_POWER_USAGE: PoE power usage at 22% of budget
+          Oct 20 00:00:01  gkw-sw1 cron[2101]: (root) CMD (newsyslog)`,
+      },
+      { id: 'nas', type: 'server', name: 'nas01', x: 160, y: 470, nic: { ip: '10.55.20.10/24', gw: '10.55.20.1', mtu: 9000 } },
+      { id: 'backup', type: 'server', name: 'backup01', x: 385, y: 470, nic: { ip: '10.55.20.20/24', gw: '10.55.20.1', mtu: 9000 } },
+      { id: 'cad', type: 'pc', name: 'CAD-WS1', x: 615, y: 470, nic: { dhcp: true, offset: 31 } },
+      { id: 'office', type: 'pc', name: 'Office-PC', x: 840, y: 470, nic: { dhcp: true, offset: 32 } },
+    ],
+    links: [
+      ['inet:ge-0/0/0', 'fw:ge-0/0/0'],
+      ['fw:ge-0/0/1', 'sw:ge-0/0/0'],
+      ['sw:ge-0/0/1', 'nas:eth0'],
+      ['sw:ge-0/0/2', 'backup:eth0'],
+      ['sw:ge-0/0/3', 'cad:eth0'],
+      ['sw:ge-0/0/4', 'office:eth0'],
+    ],
+    checks: [
+      { from: 'backup', to: '10.55.20.10', size: 8972, label: 'backup01 → nas01 full jumbo frames (backup job)' },
+      { from: 'nas', to: '10.55.20.20', size: 8972, label: 'nas01 → backup01 full jumbo frames' },
+      { from: 'backup', to: '10.55.20.10', label: 'backup01 → nas01 small packets (still works)' },
+      { from: 'cad', to: '10.55.20.10', label: 'CAD-WS1 → nas01 (still works)' },
+      { from: 'office', to: '8.8.8.8', label: 'Office-PC → Internet (still works)' },
+    ],
+    rca: {
+      question: 'What was the root cause?',
+      options: [
+        { t: 'nas01 ran out of disk space.', ok: false },
+        { t: 'The backup software has a bug that stalls large jobs.', ok: false },
+        { t: 'The vendor set both servers to 9000-byte jumbo frames, but switch ports ge-0/0/1 and ge-0/0/2 still had the default 1514-byte MTU and dropped every full-size frame.', ok: true },
+        { t: 'A speed/duplex mismatch on the backup server port.', ok: false },
+      ],
+    },
+    hints: [
+      'Small pings work. Try a big one from backup01 with Don\'t Fragment set: ping -l 8972 -f 10.55.20.10',
+      'Check the servers\' MTU with netsh interface ipv4 show subinterfaces. Then on gkw-sw1: show interfaces ge-0/0/2 extensive. Watch Oversized frames.',
+      'On gkw-sw1: set interfaces ge-0/0/1 mtu 9216 and set interfaces ge-0/0/2 mtu 9216, then commit.',
+    ],
+    debrief: [
+      'Jumbo frames have to work end to end. The vendor changed both servers to a 9000-byte MTU, but the switch ports between them stayed at the default.',
+      'Small packets (pings, browsing, opening files) still fit, so everything looked fine. Bulk transfers fill full-size frames, and the switch silently dropped every one as an oversized frame. TCP retried, stalled, and timed out.',
+      'Junos counts the 14-byte Ethernet header in its MTU. A 9000-byte IP packet needs at least 9014 on the port (9018 on a VLAN-tagged trunk). 9216 is the usual "jumbo, with room to spare" setting. Setting 9000 would have looked right and still failed.',
+      'The logs were quiet on purpose. Drops like this never write a log line. The Oversized frames counter, and a ping with size and Don\'t Fragment, are how you prove it.',
+      'The design team was fine because their PCs use a normal 1500-byte MTU. That asymmetry, small works but big fails, is the classic MTU signature.',
+    ],
+    ninja: [{ tag: 'Proved it with DF pings', say: 'You proved it with a full-size Don\'t Fragment ping. Evidence, not guesses.', test: (net, X) => X.ran(/(size 89[0-9]{2}.*do-not-fragment|do-not-fragment.*size 89[0-9]{2}|-l 89[0-9]{2}.*-f|-f.*-l 89[0-9]{2})/) }],
+  },
 ];
 if (typeof module !== 'undefined') module.exports = SCENARIOS;
 
@@ -2272,10 +2889,10 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     { id: 'jncis', name: 'JNCIS-aligned', sub: 'Specialist · later', soon: true },
     { id: 'jncip', name: 'JNCIP-aligned', sub: 'Professional · later', soon: true },
   ];
-  const QUEUE = ['T1', 'T2', 'T3', 'C1T1'];
+  const QUEUE = ['T1', 'T2', 'T3', 'C1T1', 'C2T1'];
   const JNCIA = [
-    { n: 1, title: 'Junos CLI & config basics', blurb: 'Modes, the candidate config, commit, rollback, and the safety nets that save careers.', items: ['D1', 'D2', 'D3', 'D4', 'C1T1'] },
-    { n: 2, title: 'Operational monitoring', blurb: 'Interface counters, logs, monitor, and extensive output. Reading the box before you touch it.', soon: true },
+    { n: 1, title: 'Junos CLI & config basics', blurb: 'Modes, the candidate config, commit, rollback, and the safety nets that save careers.', items: ['D1', 'D2', 'D3', 'D4', 'C1T1', 'D5', 'D6', 'D7', 'D8'] },
+    { n: 2, title: 'Operational monitoring', blurb: 'Interface counters, logs, monitor, and extensive output. Reading the box before you touch it.', items: ['D21', 'D22', 'D23', 'D24', 'C2T1'] },
     { n: 3, title: 'Networking fundamentals', blurb: 'Addressing, DHCP, VLANs, trunks, and the return path.', items: ['T1', 'T2', 'T3'] },
     { n: 4, title: 'Routing fundamentals', blurb: 'Static routes, route preference, the routing table, and a first look at OSPF.', soon: true },
     { n: 5, title: 'Routing policy & firewall filters', blurb: 'Stateless filters on interfaces, and policies that decide which routes go where.', soon: true },
@@ -2499,6 +3116,12 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       cand: (id, re) => (dv(id).candidate || []).some(l => re.test(l)) || dv(id).committed.some(l => re.test(l)),
       same: (a, b) => !!a && !!b && a.length === b.length && a.every(x => b.includes(x)),
       snap: id => G.snap[id],
+      ranMods: (re, pred, dev) => G.cmds.some(c => !c.err && re.test(c.key) && c.mods && pred(c.mods) && (!dev || c.dev === dev)),
+      idx: (re, cfg) => { for (let i = G.cmds.length - 1; i >= 0; i--) { const c = G.cmds[i]; if (!c.err && re.test(c.key) && (!cfg || c.mode === 'cfg')) return i; } return -1; },
+      firstIdx: (re, cfg) => G.cmds.findIndex(c => !c.err && re.test(c.key) && (!cfg || c.mode === 'cfg')),
+      answered: i => !!G.answers[i],
+      list: G.cmds,
+      after: (i, pred) => i >= 0 && G.cmds.some((c, k) => k > i && !c.err && pred(c)),
     };
   }
   function renderObjectives(fresh = []) {
@@ -2507,8 +3130,28 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     ol.hidden = false;
     ol.innerHTML = '';
     G.scn.objectives.forEach((o, i) => {
-      const li = el('li', (G.objDone[i] ? 'done' : '') + (fresh.includes(i) ? ' fresh' : ''), o.t);
-      if (o.cmd) {
+      const li = el('li', (G.objDone[i] ? 'done' : '') + (fresh.includes(i) ? ' fresh' : '') + (o.ask ? ' ask' : ''), o.t);
+      if (o.ask) {
+        if (G.objDone[i]) li.appendChild(el('code', 'objcmd', '✓ ' + o.ask[o.ok]));
+        else {
+          const row = el('div', 'asks');
+          o.ask.forEach((opt, j) => {
+            const b = el('button', 'askbtn' + (G.wrongPicks.has(i + '|' + j) ? ' nope' : ''), opt);
+            b.type = 'button';
+            b.disabled = G.wrongPicks.has(i + '|' + j);
+            b.addEventListener('click', () => {
+              logEv({ ev: 'answer', n: i + 1, pick: opt, ok: j === o.ok });
+              if (j === o.ok) { G.answers[i] = true; checkObjectives(); }
+              else {
+                G.wrong++; G.wrongPicks.add(i + '|' + j); sfx.bad(); renderObjectives();
+                say('interface', pick(['WRONG. Delicious. (−$10)', 'Guessing? On MY network? Bold. (−$10)', 'Nope. Read the output again. Slowly. Like I do. (−$10)']), { anim: 'shake', interrupt: true });
+              }
+            });
+            row.appendChild(b);
+          });
+          li.appendChild(row);
+        }
+      } else if (o.cmd) {
         if (G.objDone[i] || G.peeked.has(i)) li.appendChild(el('code', 'objcmd', o.cmd));
         else {
           const b = el('button', 'peek', '?');
@@ -2528,7 +3171,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     G.scn.objectives.forEach((o, i) => {
       if (G.objDone[i]) return;
       let ok = false;
-      try { ok = !!o.test(X); } catch (e) { ok = false; }
+      try { ok = o.ask ? !!G.answers[i] : !!o.test(X); } catch (e) { ok = false; }
       if (ok) { G.objDone[i] = true; fresh.push(i); }
     });
     if (!fresh.length) return;
@@ -2543,22 +3186,24 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     const s = G.scn;
     clearInterval(G.timer);
     clearPending();
+    M.q = [];
     const secs = Math.floor((Date.now() - G.t0) / 1000);
-    const helps = G.hints + G.peeks;
+    const helps = G.hints + G.peeks + G.wrong;
     const grade = helps === 0 ? 'S' : helps <= 2 ? 'A' : 'B';
     const replay = !!prog.done[s.id];
     const lines = [['Drill payout', s.reward]];
     if (G.hints) lines.push([`Hints × ${G.hints}`, -25 * G.hints]);
     if (G.peeks) lines.push([`Command peeks × ${G.peeks}`, -10 * G.peeks]);
+    if (G.wrong) lines.push([`Wrong answers × ${G.wrong}`, -10 * G.wrong]);
     const total = Math.max(0, lines.reduce((a, l) => a + l[1], 0));
     const earned = [];
     if (!helps) { earned.push('unassisted'); if (!prog.ach.includes('unassisted')) prog.ach.push('unassisted'); }
     if (!replay) { prog.cash += total; prog.rep = Math.min(100, prog.rep + 2); }
     const prev = prog.done[s.id], order = ['C', 'B', 'A', 'S'];
-    if (!prev || order.indexOf(grade) > order.indexOf(prev.grade)) prog.done[s.id] = { grade, score: 100 - G.hints * 15 - G.peeks * 7 };
+    if (!prev || order.indexOf(grade) > order.indexOf(prev.grade)) prog.done[s.id] = { grade, score: 100 - G.hints * 15 - G.peeks * 7 - G.wrong * 7 };
     save();
     renderHeader();
-    logEnd({ status: 'complete', grade, payout: replay ? 0 : total, hints: G.hints, peeks: G.peeks, notes: notesText() });
+    logEnd({ status: 'complete', grade, payout: replay ? 0 : total, hints: G.hints, peeks: G.peeks, wrong: G.wrong, notes: notesText() });
     fanfare();
     const mm = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
     const card = modal(`
@@ -2573,7 +3218,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
           <tr class="tot"><td>${replay ? 'Total (replay, no payout)' : 'Total'}</td><td>$${total}</td></tr>
           <tr><td>Reputation</td><td>${replay ? '—' : '+2'}</td></tr></table>
           <div class="earned">${earned.map(k => `<span class="ach got" title="${esc(ACH[k][1])}">${esc(ACH[k][0])}</span>`).join('')}</div>
-          <p class="eyebrow">Objectives</p><ol class="objs static">${s.objectives.map(o => `<li class="done">${esc(o.t)}${o.cmd ? `<code class="objcmd">${esc(o.cmd)}</code>` : ''}</li>`).join('')}</ol>
+          <p class="eyebrow">Objectives</p><ol class="objs static">${s.objectives.map(o => `<li class="done">${esc(o.t)}${o.ask ? `<code class="objcmd">${esc('✓ ' + o.ask[o.ok])}</code>` : o.cmd ? `<code class="objcmd">${esc(o.cmd)}</code>` : ''}</li>`).join('')}</ol>
         </div>
         <div class="story"><p class="eyebrow">What you just practiced</p>${s.debrief.map(p => `<p>${esc(p)}</p>`).join('')}</div>
       </div>
@@ -2631,7 +3276,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     const net = RC.buildNet(scn);
     G = { scn, net, tabs: [], active: null, t0: Date.now(), hints: 0, fails: 0, readLogs: false, timer: null, coachUsed: coachOn, lastSig: null, errs: 0,
       cmds: [], ev: [], facts: new Map(), factsDirty: false, labelsOn: scn.labels !== false, notesOpen: false,
-      objDone: (scn.objectives || []).map(() => false), drillDone: false, snap: {}, peeked: new Set(), peeks: 0, kageMoments: [], wentCold: false, kageDirect: false, kageConfirmed: false };
+      objDone: (scn.objectives || []).map(() => false), drillDone: false, snap: {}, peeked: new Set(), peeks: 0, ctr: new Map(), answers: {}, wrong: 0, wrongPicks: new Set(), kageMoments: [], wentCold: false, kageDirect: false, kageConfirmed: false };
     for (const d of Object.values(net.dev)) if (RC.isNet(d)) G.snap[d.id] = d.history[0] ? d.history[0].slice() : null;
     $('#notes-pane').hidden = true;
     $('#notes-ta').value = (prog.notes && prog.notes[id]) || '';
@@ -2854,7 +3499,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
   /* ---------- terminal ---------- */
   const OP_TREE = {
     show: {
-      interfaces: { _end: true, terse: null, '<interface>': { _end: true, terse: null } },
+      interfaces: { _end: true, terse: null, descriptions: null, '<interface>': { _end: true, terse: null, extensive: null } },
       vlans: null,
       'ethernet-switching': { table: null },
       route: { _end: true, '<destination>': null },
@@ -2863,16 +3508,17 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       configuration: '<rest>',
       log: { messages: null },
       version: null,
-      chassis: { alarms: null },
-      system: { commit: null, configuration: { rescue: null } },
+      chassis: { alarms: null, environment: null },
+      system: { commit: null, uptime: null, configuration: { rescue: null } },
     },
-    ping: { '<host>': { _end: true, count: '<count>' } },
+    ping: { '<host>': { _end: true, count: '<rest>', size: '<rest>', 'do-not-fragment': '<rest>', rapid: '<rest>' } },
+    monitor: { interface: { '<interface>': null } },
     traceroute: { '<host>': null },
     request: { system: { configuration: { rescue: { save: null, delete: null } } } },
     configure: null,
     edit: null,
     help: null,
-    clear: null,
+    clear: { _end: true, interfaces: { statistics: { all: null, '<interface>': null } } },
     exit: null,
     quit: null,
   };
@@ -2894,6 +3540,10 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     request: 'Make system-level requests', system: 'Show system information', rescue: 'Rescue configuration',
     save: 'Save the current configuration as the rescue configuration', comment: 'Message to write to the commit log',
     '<minutes>': 'Minutes until automatic rollback (1..65535)',
+    descriptions: 'Show interface descriptions', extensive: 'Display extensive output', uptime: 'Show time since the system booted',
+    environment: 'Show power, temperature and fan status', monitor: 'Show real-time debugging information', interface: 'Show interface traffic in real time',
+    statistics: 'Clear interface statistics', all: 'All interfaces', size: 'Size of request packets (0..65468 bytes)', 'do-not-fragment': "Don't fragment echo request packets (IPv4)",
+    rapid: 'Send requests rapidly', interfaces: 'Interface information',
   });
 
   const nodeAt = path => { const r = RC.walkTree(RC.CFG_TREE, path); return r.ok ? r.node : null; };
@@ -3068,7 +3718,8 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       print(s, 'error: ' + e.message, 'err');
       console.error(e);
     }
-    if (G && line.trim()) G.cmds.push({ dev: s.dev, mode: modeBefore, key: String(s.cmdKey || line.trim()).trim().replace(/^run /, ''), mods: s.cmdMods, err: !!s.errNote });
+    const cmdErr = !!s.errNote && /syntax error|unknown command|ambiguous|not recognized|command not found|missing argument|invalid value|Usage:|^error:/i.test(String(s.errNote).trim());
+    if (G && line.trim()) G.cmds.push({ dev: s.dev, mode: modeBefore, key: String(s.cmdKey || line.trim()).trim().replace(/^run /, ''), mods: s.cmdMods, err: cmdErr });
     let heat = null;
     if (G && s.heatKey) heat = coachReact(s, s.heatKey.trim());
     if (G && heat && G.scn.heat && !isDrill(G.scn)) {
@@ -3114,7 +3765,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     const T = r.tokens;
     s.cmdKey = T.join(' ');
     s.cmdMods = mods;
-    if (['show', 'ping', 'traceroute'].includes(T[0])) s.heatKey = T.join(' ') + (mods.compare ? ' | compare' : '');
+    if (['show', 'ping', 'traceroute', 'monitor', 'clear'].includes(T[0])) s.heatKey = T.join(' ') + (mods.compare ? ' | compare' : '');
     const lines = opRun(s, d, T, mods);
     if (!mods.compare) discoverOp(d, T);
     if (lines && lines.then) { await lines; return; }
@@ -3125,7 +3776,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     const net = G.net;
     const c0 = T[0], c1 = T[1];
     if (c0 === 'help') return opHelp();
-    if (c0 === 'clear') { s.screen.innerHTML = ''; return null; }
+    if (c0 === 'clear' && !T[1]) { s.screen.innerHTML = ''; return null; }
     if (c0 === 'exit' || c0 === 'quit') { closeTab(s); return null; }
     if (c0 === 'configure' || c0 === 'edit') {
       if (!d.candidate) d.candidate = d.committed.slice();
@@ -3138,11 +3789,33 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       if (T[4] === 'delete') { d.rescue = null; return null; }
       return ['error: syntax error'];
     }
-    if (c0 === 'ping') return doPing(s, d, T[1], T[3] ? +T[3] : 5);
+    if (c0 === 'ping') {
+      const o = { count: 5 };
+      for (let i = 2; i < T.length; i++) {
+        const w = T[i];
+        if ('count'.startsWith(w) && T[i + 1]) o.count = Math.max(1, Math.min(20, +T[++i] || 5));
+        else if ('size'.startsWith(w) && w.length >= 2 && T[i + 1]) o.size = Math.max(0, Math.min(65468, +T[++i] || 0));
+        else if ('do-not-fragment'.startsWith(w) && w.length >= 2) o.df = true;
+        else if ('rapid'.startsWith(w)) o.rapid = true;
+        else return [`error: syntax error: ${w}`];
+      }
+      return doPing(s, d, T[1], o.count, o);
+    }
+    if (c0 === 'monitor') return monitorIface(s, d, T[2]);
+    if (c0 === 'clear' && T[1] === 'interfaces') {
+      const ports = T[3] === 'all' ? d.ports : [T[3]];
+      if (T[3] !== 'all' && !d.ports.includes(T[3])) return [`error: device ${T[3]} not found`];
+      ports.forEach(p => clearCtr(d, p));
+      G.ev.push({ t: 'clear', dev: d.id, port: T[3] });
+      return null;
+    }
     if (c0 === 'traceroute') return doTrace(s, d, T[1]);
     if (c0 === 'show') {
       switch (c1) {
-        case 'interfaces': return T[2] && T[2] !== 'terse' ? (T[3] === 'terse' ? showTerse(d, T[2]) : showIface(d, T[2])) : showTerse(d);
+        case 'interfaces':
+          if (T[2] === 'descriptions') return showDescs(d);
+          if (T[2] && T[2] !== 'terse') return T[3] === 'terse' ? showTerse(d, T[2]) : T[3] === 'extensive' ? showExtensive(d, T[2]) : showIface(d, T[2]);
+          return showTerse(d);
         case 'vlans': return showVlans(d);
         case 'ethernet-switching': return showMac(d);
         case 'route': return showRoute(d, T[2]);
@@ -3157,11 +3830,18 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
           return showConfig(d.committed, T.slice(2), mods.displaySet);
         case 'system':
           if (T[2] === 'commit') return showCommits(d);
+          if (T[2] === 'uptime') return showUptime(d);
           if (T[2] === 'configuration') return d.rescue ? RC.renderTree(d.rescue) : ['error: No rescue configuration is set'];
           return ['error: syntax error'];
         case 'log': G.readLogs = true; return d.logLines.length ? d.logLines : ['(log is empty)'];
         case 'version': return [`Hostname: ${d.model.hostname}`, `Model: ${d.hw}`, 'Junos: 21.4R3-S5.4', 'JUNOS OS Kernel 64-bit  [20230516.6e2b56b_builder_stable_12]'];
-        case 'chassis': return d.rescue ? ['No alarms currently active'] : ['1 alarms currently active', 'Alarm time               Class  Description', `${stampFull()} CDT  Minor  Rescue configuration is not set`];
+        case 'chassis':
+          if (T[2] === 'environment') return showEnv(d);
+          {
+            const al = (d.alarms || []).map(a => `${a.when || stampFull()} CDT  ${pad(a.cls, 6)} ${a.text}`);
+            if (!d.rescue) al.push(`${stampFull()} CDT  Minor  Rescue configuration is not set`);
+            return al.length ? [`${al.length} alarms currently active`, 'Alarm time               Class  Description', ...al] : ['No alarms currently active'];
+          }
       }
     }
     return ['error: command not implemented in this simulator'];
@@ -3178,6 +3858,10 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       '  ping <ip> [count n]              traceroute <ip>',
       '  configure (or edit)              clear / exit',
       '  show system commit               request system configuration rescue save',
+      '  show interfaces descriptions     show interfaces <name> extensive',
+      '  monitor interface <name>         clear interfaces statistics <name|all>',
+      '  show system uptime               show chassis environment',
+      '  ping <ip> size <n> do-not-fragment',
       '  show configuration | compare rollback <n>',
       'Pipes: | match <text>  | except <text>  | count  | last <n>',
       'Keys: Tab completes, ? lists options, ↑/↓ history',
@@ -3222,9 +3906,9 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     const L = [`Physical interface: ${name}, ${adm ? 'Enabled' : 'Administratively down'}, Physical link is ${lnk ? 'Up' : 'Down'}`,
       `  Interface index: ${ifIndex(name)}, SNMP ifIndex: ${ifIndex(name)}`];
     if (i.desc) L.push(`  Description: ${i.desc}`);
-    L.push(`  Link-level type: Ethernet, MTU: 1514, Speed: ${lnk ? '1000mbps' : 'Auto'}, Duplex: ${lnk ? 'Full-Duplex' : 'Auto'}`);
+    L.push(`  Link-level type: Ethernet, MTU: ${i.mtu || 1514}, Speed: ${lnk ? '1000mbps' : 'Auto'}, Duplex: ${lnk ? 'Full-Duplex' : 'Auto'}`);
     L.push(`  Current address: ${d.mac.slice(0, 15)}${(ifIndex(name) % 256).toString(16).padStart(2, '0')}`);
-    L.push(`  Input errors: 0, Output errors: 0`);
+    { const c = ctr(d, name).v; L.push(`  Input errors: ${c.crc + c.oversize}, Output errors: ${c.mtuErr || 0}`); }
     const u = i.units['0'];
     const l2 = RC.portL2(d, name);
     L.push('', `  Logical interface ${name}.0 (Index ${ifIndex(name) + 40})`, `    Flags: ${lnk ? 'Up' : 'Down'} SNMP-Traps 0x4000`);
@@ -3313,6 +3997,118 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     return L;
   }
 
+  /* ---------- counters & monitoring ---------- */
+  function ctr(d, p) {
+    const k = d.id + '|' + p, now = Date.now();
+    let c = G.ctr.get(k);
+    if (!c) {
+      const b = (d.counters && d.counters[p]) || {}, h = RC.hash(k);
+      c = { t: now, cleared: null, v: {
+        inPkts: b.inPkts !== undefined ? b.inPkts : 2e6 + h % 9e7, outPkts: b.outPkts !== undefined ? b.outPkts : 2e6 + (h >> 3) % 9e7,
+        inBytes: 0, outBytes: 0, crc: b.crc || 0, oversize: b.oversize || 0, carrier: b.carrier !== undefined ? b.carrier : 1 + h % 3, mtuErr: b.mtuErr || 0 } };
+      c.v.inBytes = c.v.inPkts * 640; c.v.outBytes = c.v.outPkts * 590;
+      G.ctr.set(k, c);
+    }
+    const dt = (now - c.t) / 1000;
+    c.t = now;
+    if (dt > 0 && RC.linkUp(G.net, d.id, p)) {
+      const g = (G.scn.grow && G.scn.grow(G.net)) || {}, r = (g[d.id] && g[d.id][p]) || {};
+      const pps = r.pps !== undefined ? r.pps : 60 + RC.hash(k) % 140;
+      c.v.inPkts += Math.round(dt * pps); c.v.outPkts += Math.round(dt * pps * 0.9);
+      c.v.inBytes += Math.round(dt * pps * 640); c.v.outBytes += Math.round(dt * pps * 560);
+      c.rate = { inBps: Math.round(pps * 640 * 8), outBps: Math.round(pps * 560 * 8), inPps: pps, outPps: Math.round(pps * 0.9) };
+      for (const key of ['crc', 'oversize', 'mtuErr']) if (r[key]) { c.acc = c.acc || {}; c.acc[key] = (c.acc[key] || 0) + dt * r[key]; const n = Math.floor(c.acc[key]); c.v[key] += n; c.acc[key] -= n; }
+    } else if (!RC.linkUp(G.net, d.id, p)) c.rate = { inBps: 0, outBps: 0, inPps: 0, outPps: 0 };
+    return c;
+  }
+  function clearCtr(d, p) {
+    const c = ctr(d, p);
+    for (const k of Object.keys(c.v)) c.v[k] = 0;
+    c.cleared = new Date();
+  }
+  function bumpCtr(at, key, n) {
+    if (!at || !G) return;
+    const d = G.net.dev[at.dev];
+    if (!d) return;
+    const c = ctr(d, at.port);
+    if (key === 'oversize' && !at.ingress) c.v.mtuErr += n; else c.v[key] += n;
+  }
+  const big = n => String(n).padStart(20);
+  function showExtensive(d, name) {
+    if (!d.ports.includes(name)) return [`error: device ${name} not found`];
+    const L = showIface(d, name).filter(l => !/Input errors: \d+, Output errors/.test(l));
+    const c = ctr(d, name), v = c.v, rt = c.rate || { inBps: 0, outBps: 0, inPps: 0, outPps: 0 };
+    const idx = L.findIndex(l => l.startsWith('  Logical interface'));
+    const block = [
+      `  Statistics last cleared: ${c.cleared ? stampFull(c.cleared) + ' CDT (' + Math.round((Date.now() - c.cleared) / 1000) + 's ago)' : 'Never'}`,
+      '  Traffic statistics:',
+      `   Input  bytes  : ${big(v.inBytes)}  ${String(rt.inBps).padStart(12)} bps`,
+      `   Output bytes  : ${big(v.outBytes)}  ${String(rt.outBps).padStart(12)} bps`,
+      `   Input  packets: ${big(v.inPkts)}  ${String(rt.inPps).padStart(12)} pps`,
+      `   Output packets: ${big(v.outPkts)}  ${String(rt.outPps).padStart(12)} pps`,
+      '  Input errors:',
+      `    Errors: ${v.crc + v.oversize}, Drops: 0, Framing errors: ${v.crc}, Runts: 0, Policed discards: 0, L3 incompletes: 0, L2 channel errors: 0, L2 mismatch timeouts: 0, FIFO errors: 0, Resource errors: 0`,
+      '  Output errors:',
+      `    Carrier transitions: ${v.carrier}, Errors: ${v.mtuErr}, Drops: 0, Collisions: 0, Aged packets: 0, FIFO errors: 0, HS link CRC errors: 0, MTU errors: ${v.mtuErr}, Resource errors: 0`,
+      '  MAC statistics:                      Receive         Transmit',
+      `    Total octets             ${String(v.inBytes).padStart(16)} ${String(v.outBytes).padStart(16)}`,
+      `    Total packets            ${String(v.inPkts).padStart(16)} ${String(v.outPkts).padStart(16)}`,
+      `    CRC/Align errors         ${String(v.crc).padStart(16)} ${'0'.padStart(16)}`,
+      `    Oversized frames         ${String(v.oversize).padStart(16)}`,
+      `    Jabber frames            ${'0'.padStart(16)}`,
+      `    Fragment frames          ${'0'.padStart(16)}`,
+      '',
+    ];
+    L.splice(idx < 0 ? L.length : idx, 0, ...block);
+    return L;
+  }
+  function showDescs(d) {
+    const L = [pad('Interface', 16) + pad('Admin', 6) + pad('Link', 5) + 'Description'];
+    for (const p of d.ports) {
+      const i = d.model.ifaces[p];
+      if (!i || !i.desc) continue;
+      L.push(pad(p, 16) + pad(RC.adminUp(G.net, d.id, p) ? 'up' : 'down', 6) + pad(RC.linkUp(G.net, d.id, p) ? 'up' : 'down', 5) + i.desc);
+    }
+    return L;
+  }
+  function showUptime(d) {
+    const days = d.uptimeDays !== undefined ? d.uptimeDays : 3 + RC.hash(d.id) % 90;
+    const now = new Date(), boot = new Date(now - days * 864e5 - 3.6e6 * 5.2);
+    const last = d.commitLog && d.commitLog[0];
+    return ['fpc0:', '-'.repeat(74),
+      `Current time: ${stampFull(now)} CDT`, 'Time Source:  NTP CLOCK',
+      `System booted: ${stampFull(boot)} CDT (${Math.floor(days / 7)}w${days % 7}d 05:12 ago)`,
+      `Protocols started: ${stampFull(new Date(+boot + 95e3))} CDT`,
+      ...(last ? [`Last configured: ${last.when} CDT by ${last.user}`] : []),
+      `${now.toTimeString().slice(0, 5)}  up ${days} days,  5:12, 1 user, load averages: 0.21, 0.18, 0.15`];
+  }
+  function showEnv(d) {
+    const rows = d.env || [['Power', 'FPC 0 Power Supply 0', 'OK', ''], ['Temp', 'FPC 0 CPU Sensor', 'OK', '46 degrees C / 114 degrees F'],
+      ['Temp', 'FPC 0 Fan Tray 0 Sensor', 'OK', '38 degrees C / 100 degrees F'], ['Fans', 'FPC 0 Fan Tray 0 Fan 0', 'OK', 'Spinning at normal speed'],
+      ['Fans', 'FPC 0 Fan Tray 0 Fan 1', 'OK', 'Spinning at normal speed']];
+    return [pad('Class', 6) + pad('Item', 33) + pad('Status', 11) + 'Measurement', ...rows.map(r => pad(r[0], 6) + pad(r[1], 33) + pad(r[2], 11) + r[3])];
+  }
+  async function monitorIface(s, d, name) {
+    if (!d.ports.includes(name)) { print(s, `error: device ${name} not found`, 'err'); return; }
+    const first = Object.assign({}, ctr(d, name).v);
+    const lnk = RC.linkUp(G.net, d.id, name);
+    for (let sec = 1; sec <= 5; sec++) {
+      await sleep(1000);
+      if (!G) return;
+      const c = ctr(d, name), v = c.v, rt = c.rate || {};
+      const dl = k => `[${v[k] - first[k]}]`;
+      print(s, '', null);
+      print(s, `Interface: ${name}, Enabled, Link is ${lnk ? 'Up' : 'Down'}      Seconds: ${sec}   Time: ${new Date().toTimeString().slice(0, 8)}`);
+      print(s, `Encapsulation: Ethernet, Speed: ${lnk ? '1000mbps' : 'Auto'}                   Delay: 0/0/1`);
+      print(s, `  Input bytes:   ${String(v.inBytes).padStart(16)} (${rt.inBps || 0} bps)   ${dl('inBytes')}`);
+      print(s, `  Output bytes:  ${String(v.outBytes).padStart(16)} (${rt.outBps || 0} bps)   ${dl('outBytes')}`);
+      print(s, `  Input packets: ${String(v.inPkts).padStart(16)} (${rt.inPps || 0} pps)   ${dl('inPkts')}`);
+      print(s, `  Input errors:  ${String(v.crc + v.oversize).padStart(16)}   [${v.crc + v.oversize - first.crc - first.oversize}]`, v.crc + v.oversize > first.crc + first.oversize ? 'warn' : null);
+      print(s, `  CRC/Align:     ${String(v.crc).padStart(16)}   ${dl('crc')}      Oversized frames: ${v.oversize} ${dl('oversize')}`, v.crc > first.crc || v.oversize > first.oversize ? 'warn' : null);
+    }
+    print(s, '(simulator: monitor stops after 5 seconds. Real Junos keeps refreshing until you press q.)', 'dim');
+  }
+
   function showConfig(lines, pathToks, displaySet) {
     let toks = pathToks;
     if (toks.length) {
@@ -3330,19 +4126,22 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
   /* ---------- ping / traceroute ---------- */
   const ms = (n, a = 0.6, b = 2.4) => rnd(a + n * 0.4, b + n * 0.9);
 
-  async function doPing(s, d, dst, count) {
+  async function doPing(s, d, dst, count, opts = {}) {
     const net = G.net;
-    const res = RC.ping(net, d.id, dst);
+    const res = RC.ping(net, d.id, dst, opts);
+    if (res.reason === 'mtu') bumpCtr(res.at, 'oversize', count);
     const anim = animatePing(res);
     const junosStyle = RC.isNet(d) || isEmbedded(d);
     if (junosStyle) {
       if (res.reason === 'nolink') { print(s, 'ping: sendto: Network is down', 'err'); return; }
-      print(s, `PING ${dst} (${dst}): 56 data bytes`);
+      const sz = opts.size !== undefined ? opts.size : 56;
+      print(s, `PING ${dst} (${dst}): ${sz} data bytes`);
       let got = 0;
       const times = [];
       for (let i = 0; i < count; i++) {
         await sleep(i ? 380 : 200);
-        if (res.ok) { const t = ms(res.hops); times.push(t); got++; print(s, `64 bytes from ${dst}: icmp_seq=${i} ttl=${64 - Math.max(0, res.hops - 1)} time=${t.toFixed(3)} ms`); }
+        if (res.ok) { const t = ms(res.hops); times.push(t); got++; print(s, `${sz + 8} bytes from ${dst}: icmp_seq=${i} ttl=${64 - Math.max(0, res.hops - 1)} time=${t.toFixed(3)} ms`); }
+        else if (res.reason === 'local-mtu') print(s, 'ping: sendto: Message too long', 'err');
         else if (res.reason === 'noroute' && res.f && res.f.at === d.id) print(s, 'ping: sendto: No route to host', 'err');
         else if (res.reason === 'nogw') print(s, 'ping: sendto: No route to host', 'err');
         else print(s, `Request timeout for icmp_seq ${i}`, 'warn');
@@ -3356,13 +4155,15 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     } else {
       count = Math.min(count, 4);
       print(s, '', null);
-      print(s, `Pinging ${dst} with 32 bytes of data:`);
+      const sz = opts.size !== undefined ? opts.size : 32;
+      print(s, `Pinging ${dst} with ${sz} bytes of data:`);
       const a = RC.hostAddr(net, d.id);
       let got = 0;
       const times = [];
       for (let i = 0; i < count; i++) {
         await sleep(i ? 420 : 250);
-        if (res.ok) { const t = Math.max(1, Math.round(ms(res.hops, 0.2, 1.5) * (res.hops > 2 ? 6 : 1))); times.push(t); got++; print(s, `Reply from ${dst}: bytes=32 time${t < 1 ? '<1' : '='}${t}ms TTL=${128 - res.hops}`); }
+        if (res.ok) { const t = Math.max(1, Math.round(ms(res.hops, 0.2, 1.5) * (res.hops > 2 ? 6 : 1))); times.push(t); got++; print(s, `Reply from ${dst}: bytes=${sz} time${t < 1 ? '<1' : '='}${t}ms TTL=${128 - res.hops}`); }
+        else if (res.reason === 'local-mtu') print(s, 'Packet needs to be fragmented but DF set.', 'err');
         else if (res.reason === 'nolink' || res.reason === 'nogw') print(s, 'PING: transmit failed. General failure.', 'err');
         else if (res.reason === 'arp' && res.f.firstHop) { got++; print(s, `Reply from ${n2ip(a.ip)}: Destination host unreachable.`, 'err'); }
         else print(s, 'Request timed out.', 'warn');
@@ -3446,7 +4247,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       if (!r.ok) { print(s, r.error, 'err'); return; }
       if (r.tokens[0] === 'configure' || r.tokens[0] === 'edit') { print(s, 'error: already in configuration mode', 'err'); return; }
       s.cmdKey = r.tokens.join(' ');
-      if (['show', 'ping', 'traceroute'].includes(r.tokens[0])) s.heatKey = r.tokens.join(' ') + (mods.compare ? ' | compare' : '');
+      if (['show', 'ping', 'traceroute', 'monitor', 'clear'].includes(r.tokens[0])) s.heatKey = r.tokens.join(' ') + (mods.compare ? ' | compare' : '');
       const res = opRun(s, d, r.tokens, mods);
       if (!mods.compare) discoverOp(d, r.tokens);
       if (res && res.then) await res; else if (res) out(s, applyFilters(res, mods));
@@ -3559,7 +4360,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
         sub = k;
       }
       const errs = RC.checkConfig(d.candidate);
-      if (errs.length) { out(s, errs, 'err'); if (!errs.join('').includes('check-out failed')) print(s, 'error: configuration check-out failed', 'err'); sfx.bad(); banner(); return; }
+      if (errs.length) { G.ev.push({ t: sub === 'check' ? 'checkfail' : 'commitfail', dev: d.id }); out(s, errs, 'err'); if (!errs.join('').includes('check-out failed')) print(s, 'error: configuration check-out failed', 'err'); sfx.bad(); banner(); return; }
       let confirmed = false;
       if (d.confirmPending && sub !== 'confirmed') {
         clearTimeout(d.confirmPending.timer);
@@ -3568,7 +4369,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
         G.ev.push({ t: 'confirm', dev: d.id });
         logEv({ ev: 'confirm', dev: d.model.hostname });
       }
-      if (sub === 'check') { print(s, 'configuration check succeeds', 'ok'); if (confirmed) print(s, '(simulator: commit confirmed is now confirmed, rollback cancelled)', 'dim'); banner(); return; }
+      if (sub === 'check') { G.ev.push({ t: 'check', dev: d.id }); print(s, 'configuration check succeeds', 'ok'); if (confirmed) print(s, '(simulator: commit confirmed is now confirmed, rollback cancelled)', 'dim'); banner(); return; }
       const m = minutes || 10;
       if (d.candidate.join('\n') === d.committed.join('\n')) {
         if (sub === 'confirmed' && d.confirmPending) { armConfirm(d, m, null); print(s, `commit confirmed will be automatically rolled back in ${m} minutes unless confirmed`); }
@@ -3633,7 +4434,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     if (c === 'help' || c === '?') {
       out(s, isEmbedded(d)
         ? ['ipconfig            show network settings', 'ping <ip>           send 5 echo requests', 'traceroute <ip>     trace the path', 'clear               clear screen']
-        : ['ipconfig [/all]     show adapter settings', 'ping <ip>           send 4 echo requests', 'tracert <ip>        trace the path', 'arp -a              show ARP cache', 'cls                 clear screen']);
+        : ['ipconfig [/all]     show adapter settings', 'ping <ip>           send 4 echo requests', 'ping -l <size> -f <ip>   big packet, Don\'t Fragment', 'netsh interface ipv4 show subinterfaces   MTU per adapter', 'tracert <ip>        trace the path', 'arp -a              show ARP cache', 'cls                 clear screen']);
       return;
     }
     s.cmdKey = line.toLowerCase();
@@ -3647,7 +4448,28 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       if (a.up && a.gw !== null && a.gw !== undefined) fact(d.id, 'gw', 'Gateway', n2ip(a.gw), 'ipconfig');
       return;
     }
-    if (c === 'ping') { if (!t[1] || ip2n(t[1]) === null) { print(s, t[1] ? `Ping request could not find host ${t[1]}. Please check the name and try again.` : 'Usage: ping <ip address>', 'err'); return; } s.heatKey = 'ping ' + t[1]; await doPing(s, d, t[1], isEmbedded(d) ? 5 : 4); return; }
+    if (c === 'ping') {
+      const ipTok = t.slice(1).find(x => ip2n(x) !== null);
+      const o = {};
+      for (let i = 1; i < t.length; i++) {
+        const w = t[i].toLowerCase();
+        if ((w === '-l' || w === 'size' || w === '-s') && t[i + 1]) o.size = Math.max(0, Math.min(65500, +t[++i] || 0));
+        else if (w === '-f' || w === 'do-not-fragment' || w === '-df') o.df = true;
+        else if (w === '-n' && t[i + 1]) o.count = Math.max(1, Math.min(10, +t[++i] || 4));
+      }
+      if (!ipTok) { print(s, t.length > 1 ? `Ping request could not find host ${t[t.length - 1]}. Please check the name and try again.` : 'Usage: ping [-l size] [-f] <ip address>', 'err'); return; }
+      s.heatKey = line.toLowerCase();
+      await doPing(s, d, ipTok, o.count || (isEmbedded(d) ? 5 : 4), o);
+      return;
+    }
+    if (c === 'netsh' && !isEmbedded(d)) {
+      s.heatKey = 'netsh';
+      const a = RC.hostAddr(net, d.id);
+      out(s, ['', '   MTU  MediaSenseState      Bytes In    Bytes Out  Interface', '------  ---------------  ------------  -----------  -------------',
+        `${String(RC.hostMtu(d)).padStart(6)}  ${String(a.up ? 1 : 5).padStart(15)}  ${String(81234567 + RC.hash(d.id) % 9e6).padStart(12)}  ${String(93456789 + RC.hash(d.id) % 7e6).padStart(11)}  Ethernet`,
+        `${'4294967295'.padStart(6)}  ${'1'.padStart(15)}  ${'0'.padStart(12)}  ${'58211'.padStart(11)}  Loopback Pseudo-Interface 1`]);
+      return;
+    }
     if (c === 'tracert' || c === 'traceroute') { if (!t[1]) { print(s, 'Usage: tracert <ip address>', 'err'); return; } s.heatKey = 'traceroute ' + t[1]; await doTrace(s, d, t[1]); return; }
     if (c === 'arp' && !isEmbedded(d)) {
       s.heatKey = 'arp';
@@ -3729,11 +4551,12 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     const m = $('#modal');
     m.innerHTML = `<div class="modal-card ${cls}" role="dialog" aria-modal="true">${html}</div>`;
     m.hidden = false;
+    document.body.classList.add('modal-open');
     const f = m.querySelector('button, input');
     if (f) f.focus();
     return m.firstElementChild;
   }
-  const closeModal = () => { $('#modal').hidden = true; $('#modal').innerHTML = ''; };
+  const closeModal = () => { $('#modal').hidden = true; $('#modal').innerHTML = ''; document.body.classList.remove('modal-open'); };
   function flash(msg) {
     const f = $('#flash');
     f.textContent = msg;
@@ -3831,7 +4654,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     const moments = [];
     if (grade === 'S') moments.push(['Flawless', 'Flawless. Today I have nothing to teach you.']);
     if (changes < s.par) moments.push(['Under par', 'Fewer lines than par. The cleanest cut is the one nobody sees.']);
-    for (const nm of (s.ninja || [])) { try { if (nm.test(G.net)) moments.push([nm.tag, nm.say]); } catch (e) { /* ignore */ } }
+    for (const nm of (s.ninja || [])) { try { if (nm.test(G.net, objX())) moments.push([nm.tag, nm.say]); } catch (e) { /* ignore */ } }
     if (rcaOk && secs <= s.sla * 20) moments.push(['Swift', 'A third of the SLA. Swift as wind through the cedars.']);
     if (rcaOk && !G.coachUsed && !G.hints) moments.push(['Alone in the dark', 'No coach, no hints. You read the network by yourself.']);
     const kageTags = [...G.kageMoments, ...moments.map(m => m[0])];
