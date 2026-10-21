@@ -2784,7 +2784,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
 
   /* ---------- play log (saved to the artifact's private store so Claude can review it) ---------- */
   // Outside claude.ai (e.g. the GitHub Pages copy) the log goes to a Google Sheet through an Apps Script web app.
-  const SHEET_LOG_URL = '';
+  const SHEET_LOG_URL = 'https://script.google.com/macros/s/AKfycbwTzlGgOe87lgdYU5ANyVciFE3aJ0ecacO79I1AlP6qnzj_0VqGtqC73t914kts6nvISg/exec';
   const LOG = { db: null, ref: null, doc: null, id: null, sheet: false, dirty: false, busy: false, again: false, timer: null };
   let sheetOn = true;
   try { sheetOn = localStorage.getItem('rootcause.sheetlog') !== 'off'; } catch (e) { /* ignore */ }
