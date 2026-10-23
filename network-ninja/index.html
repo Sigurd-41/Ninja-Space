@@ -48,6 +48,8 @@ button { font: inherit; color: inherit; cursor: pointer; }
 #repfill { height: 100%; background: linear-gradient(90deg, var(--violet), var(--cyan)); transition: width .6s; }
 .chipbtn { background: transparent; border: 1px solid var(--line); border-radius: 4px; padding: 5px 10px; font: 600 11px var(--f-display); letter-spacing: .1em; text-transform: uppercase; color: var(--dim); }
 .chipbtn:hover { color: var(--fg); border-color: var(--dim); }
+.namefield { width: 100%; margin: 6px 0 4px; background: var(--panel2); border: 1px solid var(--line); border-radius: 4px; padding: 10px 12px; color: var(--fg); font: 16px var(--f-mono); caret-color: var(--amber); }
+.namefield:focus { outline: none; border-color: var(--cyan); box-shadow: 0 0 0 2px rgba(62,230,255,.2); }
 .logchip { cursor: default; color: var(--green); border-color: rgba(95,240,168,.35); }
 .logchip[role="button"] { cursor: pointer; }
 .logchip.off { color: var(--faint); border-color: var(--line); }
@@ -396,6 +398,7 @@ table.facts td.empty { color: var(--faint); font-family: var(--f-body); }
       <div class="stat"><small>Rank</small><b id="rank">Junior Tech</b></div>
       <div class="stat"><small>Cash</small><b id="cash">$0</b></div>
       <div class="stat"><small>Rep <span id="repval">50</span></small><div class="rep"><div id="repfill"></div></div></div>
+      <button class="chipbtn" id="playerchip" hidden title="Your player name for the play log. Click to change.">Player</button>
       <span class="chipbtn logchip" id="logchip" hidden title="Each ticket you play is saved privately so Claude can review your approach.">Play log on</span>
       <button class="chipbtn" id="coach" aria-pressed="true" title="Rowdy Router tells you if you're hot or cold">Coach on</button>
       <button class="chipbtn" id="sound" aria-pressed="true">Sound on</button>
@@ -2801,13 +2804,27 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     c.title = sheetOn ? 'Finished tickets are sent to a private Google Sheet so Claude can review your play. Click to turn off.' : 'Play log is off. Click to turn it back on.';
   }
   if (!(window.claude && window.claude.use) && SHEET_LOG_URL) LOG.sheet = true;
+  // Player identity for the shared sheet: a name the player picks plus a random tag, kept in this browser only.
+  const PLAYER = { name: '', tag: '' };
+  try { PLAYER.name = localStorage.getItem('rootcause.player') || ''; PLAYER.tag = localStorage.getItem('rootcause.playertag') || ''; } catch (e) { /* ignore */ }
+  if (!PLAYER.tag) {
+    PLAYER.tag = Math.random().toString(36).slice(2, 6);
+    try { localStorage.setItem('rootcause.playertag', PLAYER.tag); } catch (e) { /* ignore */ }
+  }
+  const playerId = () => `${PLAYER.name || 'anon'}#${PLAYER.tag}`;
+  function renderPlayerChip() {
+    const c = document.getElementById('playerchip');
+    if (!c) return;
+    c.hidden = !LOG.sheet;
+    c.textContent = PLAYER.name ? PLAYER.name : 'Set name';
+  }
   const elapsed = () => (G ? Math.round((Date.now() - G.t0) / 1000) : 0);
   (async () => {
     try {
       const use = window.claude && window.claude.use;
       if (!use) return;
       const db = await window.claude.use('db');
-      if (db) { LOG.db = db; LOG.sheet = false; renderLogChip(); }
+      if (db) { LOG.db = db; LOG.sheet = false; renderLogChip(); renderPlayerChip(); }
     } catch (e) { /* no store in this view */ }
   })();
   function logDisable() {
@@ -2817,12 +2834,12 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
   function logStart() {
     const viaSheet = !LOG.db && LOG.sheet && sheetOn;
     if ((!LOG.db && !viaSheet) || !G) { LOG.doc = null; return; }
-    const id = `${G.scn.id}-${G.t0}`;
+    const id = LOG.sheet && !LOG.db ? `${playerId()}-${G.scn.id}-${G.t0}` : `${G.scn.id}-${G.t0}`;
     LOG.id = id;
     LOG.ref = null;
     if (LOG.db) { try { LOG.ref = LOG.db.collection('playlog').doc(id); } catch (e) { logDisable(); return; } }
     LOG.doc = {
-      ticketId: G.scn.id, ticket: G.scn.ticket, title: G.scn.title, client: G.scn.client,
+      player: playerId(), ticketId: G.scn.id, ticket: G.scn.ticket, title: G.scn.title, client: G.scn.client,
       startedAt: new Date(G.t0).toISOString(), status: 'in progress', elapsedSec: 0,
       slaMin: G.scn.sla, par: G.scn.par, replay: !!prog.done[G.scn.id], events: [],
     };
@@ -2850,7 +2867,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       LOG.dirty = false;
       try {
         await fetch(SHEET_LOG_URL, { method: 'POST', mode: 'no-cors', keepalive: true, headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: JSON.stringify({ id: LOG.id, source: location.host || 'local', doc: LOG.doc }) });
+          body: JSON.stringify({ id: LOG.id, player: playerId(), source: location.host || 'local', doc: LOG.doc }) });
       } catch (e) { LOG.dirty = true; }
       return;
     }
@@ -4767,6 +4784,34 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       renderLogChip();
       flash(sheetOn ? 'Play log on. New tickets will be logged.' : 'Play log off. Nothing will be sent.');
     };
+    const askName = (first) => {
+      const card = modal(`<p class="eyebrow">Iga Ridge Network Services · HR</p>
+        <h2>${first ? 'Welcome aboard. Name for the badge?' : 'Change your player name'}</h2>
+        <p>Shown on your play log so your tickets don't get mixed up with anyone else's. First name or a handle is plenty.</p>
+        <form id="nameform"><input class="namefield" id="pname" maxlength="24" autocomplete="off" spellcheck="false" placeholder="e.g. Kenji" value="${esc(PLAYER.name)}">
+        <div class="modal-actions">${first ? '<button class="btn ghost" type="button" id="pskip">Skip</button>' : '<button class="btn ghost" type="button" id="pskip">Cancel</button>'}<button class="btn primary" type="submit">Save</button></div></form>`);
+      const inp = card.querySelector('#pname');
+      inp.focus(); inp.select();
+      card.querySelector('#nameform').addEventListener('submit', e => {
+        e.preventDefault();
+        const v = inp.value.replace(/[^\p{L}\p{N} ._-]/gu, '').trim().slice(0, 24);
+        if (v) {
+          PLAYER.name = v;
+          try { localStorage.setItem('rootcause.player', v); } catch (er) { /* ignore */ }
+        }
+        closeModal(); renderPlayerChip();
+        if (v) flash(`Badge printed: ${v}.`);
+      });
+      card.querySelector('#pskip').addEventListener('click', () => {
+        if (first) { try { localStorage.setItem('rootcause.player', ''); } catch (er) { /* ignore */ } }
+        closeModal(); renderPlayerChip();
+      });
+    };
+    $('#playerchip').addEventListener('click', () => askName(false));
+    renderPlayerChip();
+    let askedBefore = false;
+    try { askedBefore = localStorage.getItem('rootcause.player') !== null; } catch (e) { askedBefore = true; }
+    if (LOG.sheet && !askedBefore) setTimeout(() => { if (!LOG.db && $('#modal').hidden) askName(true); }, 600);
     $('#logchip').addEventListener('click', toggleSheet);
     $('#logchip').addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggleSheet(); } });
     renderLogChip();
