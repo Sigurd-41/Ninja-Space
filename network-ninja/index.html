@@ -320,6 +320,10 @@ body.modal-open #mascot { top: calc(14px + env(safe-area-inset-top, 0px)); botto
 .ch-prog { margin-left: auto; font: 600 12px var(--f-mono); color: var(--dim); white-space: nowrap; padding-top: 4px; }
 .ch-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); }
 .prio.drill { color: var(--violet); border-color: rgba(155,140,255,.5); }
+.prio.build { color: var(--green); border-color: rgba(95,240,168,.5); }
+.card.build::after { background: linear-gradient(90deg, var(--green), transparent); }
+.topicline { margin: 0; display: grid; gap: 3px; font: 500 12px/1.4 var(--f-mono); color: var(--dim); border: 1px dashed rgba(155,140,255,.4); border-radius: 4px; padding: 6px 9px; cursor: help; }
+.topicline b { color: var(--violet); font-weight: 600; margin-right: 4px; }
 .card.drill::after { background: linear-gradient(90deg, var(--violet), transparent); }
 .soon-card h3 { margin: 0; }
 
@@ -437,6 +441,10 @@ show interfaces ge-0/0/7
 show vlans
 show ethernet-switching table
 show route [ip]
+show route hidden
+show route protocol ospf|static
+show ospf neighbor
+show ospf interface
 show arp no-resolve
 show lldp neighbors
 show configuration [| display set]
@@ -468,6 +476,7 @@ Tab completes · ? shows options
     <aside class="rail">
       <div class="rail-head" id="t-head"></div>
       <div><h2 id="t-title"></h2><p id="t-client"></p></div>
+      <p id="t-topic" class="topicline" hidden></p>
       <div class="timerbox"><span id="t-timer-label">SLA remaining</span><span class="timer" id="t-timer">00:00</span></div>
       <p id="t-brief"></p>
       <p id="t-reporter"></p>
@@ -564,11 +573,20 @@ const RC = (() => {
     text: t => true,
     hostname: t => /^[\w.-]+$/.test(t),
     destination: t => ip2n(t) !== null || !!parseCidr(t),
-    host: t => ip2n(t) !== null,
+    host: t => ip2n(t) !== null || /^[A-Za-z][\w.-]{0,62}$/.test(t),
     count: t => /^\d+$/.test(t) && +t >= 1 && +t <= 20,
     number: t => /^\d+$/.test(t) && +t <= 49,
     minutes: t => /^\d+$/.test(t),
     mtu: t => /^\d+$/.test(t) && +t >= 256 && +t <= 9216,
+    preference: t => /^\d+$/.test(t) && +t >= 0 && +t <= 255,
+    metric: t => /^\d+$/.test(t) && +t >= 1 && +t <= 65535,
+    area: t => /^\d+$/.test(t) || ip2n(t) !== null,
+    'ospf-iface': t => /^((ge|xe|et)-\d+\/\d+\/\d+|irb|lo0)(\.\d{1,5})?$/.test(t),
+  };
+  // Junos rewrites some values as you type them: "area 0" becomes 0.0.0.0, "interface ge-0/0/1" becomes ge-0/0/1.0.
+  const NORM = {
+    area: t => (/^\d+$/.test(t) ? n2ip(+t >>> 0) : t),
+    'ospf-iface': t => (t.includes('.') ? t : t + '.0'),
   };
   const CFG_TREE = {
     interfaces: {
@@ -590,7 +608,8 @@ const RC = (() => {
       },
     },
     vlans: { '<vlan-name>': { 'vlan-id': '<vlan-id>', 'l3-interface': '<l3-interface>' } },
-    'routing-options': { static: { route: { '<prefix>': { 'next-hop': '<next-hop>' } } } },
+    'routing-options': { static: { route: { '<prefix>': { 'next-hop': '<next-hop>', 'qualified-next-hop': { '<next-hop>': { _end: true, preference: '<preference>' } }, preference: '<preference>' } } } },
+    protocols: { ospf: { area: { '<area>': { interface: { '<ospf-iface>': { _end: true, passive: null, metric: '<metric>' } } } } } },
     system: { 'host-name': '<hostname>' },
   };
   const HELP = {
@@ -604,9 +623,13 @@ const RC = (() => {
     '<interface>': 'Interface name (e.g. ge-0/0/7, irb)', '<unit>': 'Logical unit number', '<vlan-name>': 'VLAN name',
     '<prefix>': 'Destination prefix (x.x.x.x/len)',
     mtu: 'Maximum transmission unit packet size', '<mtu>': 'MTU in bytes, including the 14-byte Ethernet header (256..9216)',
+    'qualified-next-hop': 'Next hop with qualifiers (its own preference)', preference: 'Preference value (lower wins)', '<preference>': 'Route preference (0..255)',
+    protocols: 'Routing protocol configuration', ospf: 'OSPF configuration', area: 'Configure an OSPF area', '<area>': 'Area ID (e.g. 0.0.0.0 or 0)',
+    interface: 'Include an interface in this area', '<ospf-iface>': 'Logical interface (e.g. ge-0/0/1.0, irb.10, lo0.0)',
+    passive: 'Advertise this interface but do not form neighbors on it', metric: 'Interface cost', '<metric>': 'Cost (1..65535)',
   };
-  const VALUE_KEYS = new Set(['description', 'members', 'address', 'vlan-id', 'l3-interface', 'host-name', 'next-hop', 'interface-mode', 'mtu']);
-  const SINGLE_VALUED = new Set(['description', 'vlan-id', 'l3-interface', 'host-name', 'interface-mode', 'next-hop', 'mtu']);
+  const VALUE_KEYS = new Set(['description', 'members', 'address', 'vlan-id', 'l3-interface', 'host-name', 'next-hop', 'interface-mode', 'mtu', 'preference', 'metric']);
+  const SINGLE_VALUED = new Set(['description', 'vlan-id', 'l3-interface', 'host-name', 'interface-mode', 'next-hop', 'mtu', 'preference', 'metric']);
 
   // Walk tokens through a grammar tree. Returns {ok, tokens (expanded), lines:[[tokens]], node, error, errIdx}
   function walkTree(tree, toks, opts = {}) {
@@ -646,7 +669,7 @@ const RC = (() => {
         const kind = ph.slice(1, -1);
         if (kind === 'rest') { out.push(...toks.slice(i)); return { ok: true, tokens: out, node: null, rest: true }; }
         const fn = V[kind];
-        if (!fn || fn(t)) { out.push(t); node = node[ph]; continue; }
+        if (!fn || fn(t)) { out.push(NORM[kind] ? NORM[kind](t) : t); node = node[ph]; continue; }
       }
       const cands = keys.filter(k => !k.startsWith('<') && k.startsWith(t));
       if (cands.length === 1 && /^[a-z-]+$/.test(t)) { out.push(cands[0]); node = node[cands[0]]; continue; }
@@ -666,7 +689,9 @@ const RC = (() => {
 
   /* ---------- config parsing ---------- */
   function parseConfig(lines) {
-    const m = { hostname: '', ifaces: {}, vlans: { default: { name: 'default', id: 1, l3: null } }, routes: [] };
+    const m = { hostname: '', ifaces: {}, vlans: { default: { name: 'default', id: 1, l3: null } }, routes: [], ospf: null };
+    const ST = {};
+    const SR = p => ST[p] || (ST[p] = { nh: [], qnh: [], pref: null });
     const IF = n => m.ifaces[n] || (m.ifaces[n] = { name: n, disable: false, desc: '', units: {} });
     for (const line of lines) {
       const t = tokenize(line);
@@ -691,8 +716,27 @@ const RC = (() => {
         if (t[2] === 'vlan-id') v.id = +t[3];
         if (t[2] === 'l3-interface') v.l3 = t[3];
       } else if (t[0] === 'routing-options' && t[1] === 'static' && t[2] === 'route' && t[3]) {
-        m.routes.push({ prefix: t[3], nh: t[5] || null });
+        const r = SR(t[3]);
+        if (t[4] === 'next-hop' && t[5]) r.nh.push(t[5]);
+        else if (t[4] === 'qualified-next-hop' && t[5]) {
+          let q = r.qnh.find(x => x.ip === t[5]);
+          if (!q) r.qnh.push(q = { ip: t[5], pref: null });
+          if (t[6] === 'preference' && t[7]) q.pref = +t[7];
+        } else if (t[4] === 'preference' && t[5]) r.pref = +t[5];
+      } else if (t[0] === 'protocols' && t[1] === 'ospf' && t[2] === 'area' && t[3] && t[4] === 'interface' && t[5]) {
+        m.ospf = m.ospf || { ifaces: {} };
+        const name = t[5].includes('.') ? t[5] : t[5] + '.0';
+        const o = m.ospf.ifaces[name] || (m.ospf.ifaces[name] = { name, area: NORM.area(t[3]), passive: false, metric: null });
+        o.area = NORM.area(t[3]);
+        if (t[6] === 'passive') o.passive = true;
+        if (t[6] === 'metric' && t[7]) o.metric = +t[7];
       }
+    }
+    for (const [prefix, r] of Object.entries(ST)) {
+      const base = r.pref === null ? 5 : r.pref;
+      if (!r.nh.length && !r.qnh.length) m.routes.push({ prefix, nh: null, pref: base });
+      for (const nh of r.nh) m.routes.push({ prefix, nh, pref: base });
+      for (const q of r.qnh) m.routes.push({ prefix, nh: q.ip, pref: q.pref === null ? base : q.pref, qualified: true });
     }
     return m;
   }
@@ -723,6 +767,12 @@ const RC = (() => {
       else seen[v.id] = v.name;
     }
     for (const r of m.routes) if (!r.nh) errs.push(`error: static route ${r.prefix}: next-hop is required`);
+    if (m.ospf) for (const o of Object.values(m.ospf.ifaces)) {
+      const [ifn, unit] = o.name.split('.');
+      if (ifn === 'lo0' || ifn === 'irb') continue;
+      const i = m.ifaces[ifn];
+      if (i && i.units[unit] && i.units[unit].es) errs.push(`error: OSPF interface ${o.name}: family ethernet-switching cannot run OSPF`);
+    }
     return errs;
   }
 
@@ -751,7 +801,7 @@ const RC = (() => {
           out.push(vals.length > 1 ? `${pad}${k} [ ${vals.join(' ')} ];` : `${pad}${k} ${vals[0]};`);
           continue;
         }
-        if (k === 'unit' || k === 'route') {
+        if (k === 'unit' || k === 'route' || k === 'qualified-next-hop' || k === 'area' || (k === 'interface' && parentKey === 'area')) {
           for (const [name, sub] of ch) {
             if (k === 'route' && sub.size === 1) {
               const [k2, c2] = [...sub][0];
@@ -759,7 +809,7 @@ const RC = (() => {
             }
             if (sub.size === 0) { out.push(`${pad}${k} ${name};`); continue; }
             out.push(`${pad}${k} ${name} {`);
-            rec(sub, ind + 1, k);
+            rec(sub, ind + 1, k === 'interface' ? 'ospf-if' : k);
             out.push(`${pad}}`);
           }
           continue;
@@ -974,27 +1024,115 @@ const RC = (() => {
     return out;
   }
 
+  /* ---------- OSPF (simplified: one SPF across all areas, broadcast links, no LSAs) ---------- */
+  const ospfCost = (name, o) => (o && o.metric) || (name.startsWith('lo0') ? 0 : 1); // 100 Mbps reference bandwidth: 1G and faster = 1
+  function ipMtu(d, l3name) {
+    const port = l3name.split('.')[0];
+    if (port === 'irb' || port === 'lo0') return 1500;
+    const i = d.model.ifaces[port];
+    return ((i && i.mtu) || 1514) - 14;
+  }
+  function routerId(net, d) {
+    const lo = d.model.ifaces.lo0 && d.model.ifaces.lo0.units['0'] && d.model.ifaces.lo0.units['0'].inet[0];
+    if (lo) return parseCidr(lo).ip;
+    const ifs = l3Ifaces(net, d);
+    return ifs.length ? ifs[0].ip : 0;
+  }
+  function epIfName(e) { return e.kind === 'irb' ? 'irb.' + e.unit : e.port + '.0'; }
+  function ospf(net) {
+    if (net.cache.has('ospf')) return net.cache.get('ospf');
+    const R = {};
+    for (const d of Object.values(net.dev)) {
+      if (isHost(d) || !d.model.ospf) continue;
+      const live = l3Ifaces(net, d);
+      const oifs = Object.values(d.model.ospf.ifaces).map(o => ({ ...o, l3: live.find(i => i.name === o.name) || null, cost: ospfCost(o.name, o) }));
+      R[d.id] = { id: d.id, rid: routerId(net, d), oifs, nbrs: [], routes: [], issues: [] };
+    }
+    // adjacencies
+    for (const r of Object.values(R)) {
+      const d = net.dev[r.id];
+      for (const o of r.oifs) {
+        if (!o.l3 || !o.l3.start || o.passive) continue;
+        for (const e of segment(net, o.l3.start)) {
+          if (e.dev === r.id || e.kind === 'host' || !R[e.dev]) continue;
+          const peer = R[e.dev];
+          const po = peer.oifs.find(x => x.name === epIfName(e));
+          if (!po || !po.l3) continue;
+          if (po.passive) continue;
+          if (po.l3.prefix !== o.l3.prefix || !inSubnet(po.l3.ip, o.l3.ip, o.l3.prefix)) { r.issues.push({ kind: 'mask', iface: o.name, peer: e.dev }); continue; }
+          if (po.area !== o.area) { r.issues.push({ kind: 'area', iface: o.name, peer: e.dev, mine: o.area, theirs: po.area, addr: po.l3.ip }); continue; }
+          const mtuOk = ipMtu(d, o.name) === ipMtu(net.dev[e.dev], po.name);
+          r.nbrs.push({ dev: e.dev, addr: po.l3.ip, rid: peer.rid, iface: o.name, l3: o.l3, area: o.area, state: mtuOk ? 'Full' : 'ExStart', cost: o.cost });
+          if (!mtuOk) r.issues.push({ kind: 'mtu', iface: o.name, peer: e.dev, mine: ipMtu(d, o.name), theirs: ipMtu(net.dev[e.dev], po.name) });
+        }
+      }
+    }
+    // SPF from every router
+    for (const r of Object.values(R)) {
+      const dist = { [r.id]: 0 }, first = {}, done = new Set();
+      for (;;) {
+        let u = null;
+        for (const k of Object.keys(dist)) if (!done.has(k) && (u === null || dist[k] < dist[u])) u = k;
+        if (u === null) break;
+        done.add(u);
+        for (const n of R[u].nbrs) {
+          if (n.state !== 'Full') continue;
+          const nd = dist[u] + n.cost;
+          if (dist[n.dev] === undefined || nd < dist[n.dev]) { dist[n.dev] = nd; first[n.dev] = u === r.id ? n : first[u]; }
+        }
+      }
+      const best = new Map();
+      for (const [dev, dd] of Object.entries(dist)) {
+        if (dev === r.id) continue;
+        for (const o of R[dev].oifs) {
+          if (!o.l3) continue;
+          const pfx = o.l3.start ? o.l3.prefix : 32;
+          const key = netAddr(o.l3.ip, pfx) + '/' + pfx;
+          const metric = dd + o.cost;
+          const prev = best.get(key);
+          if (!prev || metric < prev.metric) best.set(key, { net: netAddr(o.l3.ip, pfx), prefix: pfx, metric, nh: first[dev].addr, iface: first[dev].l3 });
+        }
+      }
+      r.routes = [...best.values()];
+    }
+    net.cache.set('ospf', R);
+    return R;
+  }
+
   function routeTable(net, d) {
     const ifs = l3Ifaces(net, d);
     const rt = [];
     for (const i of ifs) {
-      if (i.start) rt.push({ net: netAddr(i.ip, i.prefix), prefix: i.prefix, type: 'Direct', iface: i, nh: null });
-      rt.push({ net: i.ip, prefix: 32, type: 'Local', iface: i, nh: null });
+      if (i.start) rt.push({ net: netAddr(i.ip, i.prefix), prefix: i.prefix, type: 'Direct', pref: 0, iface: i, nh: null });
+      rt.push({ net: i.ip, prefix: 32, type: 'Local', pref: 0, iface: i, nh: null });
     }
     for (const r of d.model.routes) {
       const c = parseCidr(r.prefix), nh = ip2n(r.nh);
       if (!c || nh === null) continue;
       const i = ifs.find(i => i.start && inSubnet(nh, i.ip, i.prefix));
-      rt.push({ net: netAddr(c.ip, c.prefix), prefix: c.prefix, type: 'Static', iface: i || null, nh, hidden: !i });
+      rt.push({ net: netAddr(c.ip, c.prefix), prefix: c.prefix, type: 'Static', pref: r.pref === undefined ? 5 : r.pref, iface: i || null, nh, hidden: !i, qualified: !!r.qualified });
     }
-    rt.sort((a, b) => a.net - b.net || a.prefix - b.prefix);
+    if (d.model.ospf) {
+      const o = ospf(net)[d.id];
+      if (o) for (const r of o.routes) rt.push({ net: r.net, prefix: r.prefix, type: 'OSPF', pref: 10, metric: r.metric, iface: r.iface, nh: r.nh });
+    }
+    // one active route per destination: lowest preference, then lowest metric
+    const groups = new Map();
+    for (const r of rt) {
+      if (r.hidden || r.type === 'Local') continue;
+      const k = r.net + '/' + r.prefix;
+      const b = groups.get(k);
+      if (!b || r.pref < b.pref || (r.pref === b.pref && (r.metric || 0) < (b.metric || 0))) groups.set(k, r);
+    }
+    for (const r of rt) if (!r.hidden && r.type !== 'Local') r.active = groups.get(r.net + '/' + r.prefix) === r;
+    rt.sort((a, b) => a.net - b.net || a.prefix - b.prefix || (b.active ? 1 : 0) - (a.active ? 1 : 0) || a.pref - b.pref);
     return rt;
   }
 
   function lookup(net, d, dst) {
     let best = null;
     for (const r of routeTable(net, d)) {
-      if (r.hidden || r.type === 'Local') continue;
+      if (r.hidden || r.type === 'Local' || !r.active) continue;
       if (!inSubnet(dst, r.net, r.prefix)) continue;
       if (!best || r.prefix > best.prefix) best = r;
     }
@@ -1101,8 +1239,28 @@ const RC = (() => {
     return { ok: f.ok && hops.length && hops[hops.length - 1].reply, reached: f.ok, f, hops, src };
   }
 
+  // A verification check. Options: size (DF ping), cut / restore: ['dev:port'] (fail or repair a link first),
+  // via / avoid: device ids the path must (or must not) cross, fail: true (must NOT work), test(net, RC): custom.
   function check(net, c) {
-    return ping(net, c.from, c.to, c.size ? { size: c.size, df: true } : {}).ok;
+    const saved = [];
+    for (const [specs, val] of [[c.cut, true], [c.restore, false]]) for (const spec of specs || []) {
+      const [dev, port] = spec.split(':');
+      const l = findLink(net, dev, port);
+      if (l) { saved.push([l, l.cut]); l.cut = val; }
+    }
+    if (saved.length) net.cache.clear();
+    try {
+      if (c.test) return !!c.test(net, RC_API);
+      const r = ping(net, c.from, c.to, c.size ? { size: c.size, df: true } : {});
+      if (c.fail) return !r.ok;
+      if (!r.ok) return false;
+      const path = (r.f && r.f.devPath) || [];
+      if (c.via && ![].concat(c.via).every(v => path.includes(v))) return false;
+      if (c.avoid && [].concat(c.avoid).some(v => path.includes(v))) return false;
+      return true;
+    } finally {
+      if (saved.length) { for (const [l, was] of saved) l.cut = was; net.cache.clear(); }
+    }
   }
 
   /* ---------- operational data for CLI ---------- */
@@ -1142,12 +1300,14 @@ const RC = (() => {
     return { removed: a.filter(x => !sb.has(x)), added: b.filter(x => !sa.has(x)) };
   }
 
-  return {
+  const RC_API = {
     ip2n, n2ip, maskN, parseCidr, inSubnet, netAddr, tokenize, walkTree, completions, CFG_TREE, SINGLE_VALUED,
     parseConfig, checkConfig, renderTree, buildNet, commitDevice, peerOf, linkUp, adminUp, portL2, routedAddr,
     segment, hostAddr, l3Ifaces, routeTable, lookup, forward, ping, traceroute, check, macTable, arpTable,
     vlanIdOf, vlanNameOf, isHost, isNet, configDiff, HELP, VALUE_KEYS, maskN, hostMtu, hash,
+    ospf, ipMtu, routerId, NORM,
   };
+  return RC_API;
 })();
 if (typeof module !== 'undefined') module.exports = RC;
 
@@ -2470,7 +2630,1158 @@ const SCENARIOS = [
     ],
     ninja: [{ tag: 'Proved it with DF pings', say: 'You proved it with a full-size Don\'t Fragment ping. Evidence, not guesses.', test: (net, X) => X.ran(/(size 89[0-9]{2}.*do-not-fragment|do-not-fragment.*size 89[0-9]{2}|-l 89[0-9]{2}.*-f|-f.*-l 89[0-9]{2})/) }],
   },
+  /* ================= JNCIA additions (Nov 4) ================= */
+  {
+    id: 'B31', kind: 'design', ticket: 'BUILD-301', priority: 'P3', sla: 30, reward: 700, par: 9,
+    client: 'Narai-juku Lacquerware', title: 'Give the cameras their own VLAN',
+    reporter: 'Haruka, Owner',
+    topic: { area: 'VLAN design and inter-VLAN routing', jncia: 'Networking Fundamentals', ccna: 'Network Access' },
+    brief: 'A build, not a break. Two PoE cameras and an NVR arrived for the workshop and showroom. The installer patched them into ge-0/0/5, ge-0/0/6 and ge-0/0/7, which still sit in the dead-end PARKING VLAN. The cameras and NVR are pre-set to 10.82.40.x with gateway 10.82.40.1. Build their network to the spec.',
+    quotes: [
+      ['Spec', 'VLAN name CAMERAS, VLAN ID 40, subnet 10.82.40.0/24, gateway 10.82.40.1 on nrj-sw1 (irb.40).'],
+      ['Spec', 'Cameras on ge-0/0/5 and ge-0/0/6, NVR on ge-0/0/7. Cameras must NOT share the OFFICE VLAN.'],
+      ['Haruka', 'I want to watch the showroom camera from the office PC. And please do not break the printer.'],
+    ],
+    focus: 'sw',
+    villain: 'A whole new VLAN? So many places to forget a step. I\'ll wait. Heh.',
+    heat: {
+      devs: { sw: 2, fw: -2, pc: 1, prn: -1, cam1: 1, cam2: 1, nvr: 1 },
+      clues: [
+        { dev: 'sw', re: /^set vlans CAMERAS (vlan-id 40|l3-interface irb\.40)/, h: 3, say: ['That\'s the VLAN. Now give it a gateway.', 'Good. Ports next. Or the gateway. Your blueprint, boss.'] },
+        { dev: 'sw', re: /^set interfaces irb unit 40 family inet address 10\.82\.40\.1\/24/, h: 3, say: ['Gateway\'s in. Who\'s still parked?'] },
+        { dev: 'sw', re: /^set interfaces ge-0\/0\/[567] .*vlan members CAMERAS/, h: 3, say: ['Access ports take ONE VLAN. Did PARKING leave yet?'] },
+        { dev: 'sw', re: /^delete interfaces ge-0\/0\/[567] .*vlan members/, h: 2 },
+        { dev: 'sw', re: /^commit check/, h: 2, say: ['Check first. Rowdy approves.'] },
+        { dev: 'sw', re: /^show (vlans|configuration|interfaces)/, h: 1 },
+        { dev: ['cam1', 'cam2', 'nvr'], re: /^ping/, h: 1, say: ['They can\'t reach a gateway that doesn\'t exist yet.'] },
+        { dev: 'fw', re: /./, h: -2, say: ['The firewall already routes all of 10.82.0.0/16 to the switch. Build on the switch.'] },
+        { dev: 'prn', re: /./, h: -1, say: ['The printer\'s fine. Leave it be.'] },
+      ],
+    },
+    devices: [
+      ISP_CLOUD(),
+      {
+        id: 'fw', type: 'firewall', name: 'nrj-fw', hw: 'srx300', x: 500, y: 160, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name nrj-fw
+          set interfaces ge-0/0/0 description "ISP uplink"
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.2/30
+          set interfaces ge-0/0/1 description "to nrj-sw1"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.0.255.1/30
+          set routing-options static route 0.0.0.0/0 next-hop 203.0.113.1
+          set routing-options static route 10.82.0.0/16 next-hop 10.0.255.2`,
+      },
+      {
+        id: 'sw', type: 'switch', name: 'nrj-sw1', hw: 'ex2300-24p', x: 500, y: 300, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2', 'ge-0/0/5', 'ge-0/0/6', 'ge-0/0/7'],
+        config: `
+          set system host-name nrj-sw1
+          set interfaces ge-0/0/0 description "uplink to nrj-fw"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.0.255.2/30
+          set interfaces ge-0/0/1 description "office pc"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members OFFICE
+          set interfaces ge-0/0/2 description "printer"
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members OFFICE
+          set interfaces ge-0/0/5 description "camera - workshop (new)"
+          set interfaces ge-0/0/5 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/5 unit 0 family ethernet-switching vlan members PARKING
+          set interfaces ge-0/0/6 description "camera - showroom (new)"
+          set interfaces ge-0/0/6 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/6 unit 0 family ethernet-switching vlan members PARKING
+          set interfaces ge-0/0/7 description "nvr (new)"
+          set interfaces ge-0/0/7 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/7 unit 0 family ethernet-switching vlan members PARKING
+          set interfaces irb unit 10 family inet address 10.82.10.1/24
+          set vlans OFFICE vlan-id 10
+          set vlans OFFICE l3-interface irb.10
+          set vlans PARKING vlan-id 999
+          set routing-options static route 0.0.0.0/0 next-hop 10.0.255.1`,
+        logs: `
+          Nov  3 15:02:11  nrj-sw1 mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 517, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/5
+          Nov  3 15:04:40  nrj-sw1 mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 518, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/6
+          Nov  3 15:09:03  nrj-sw1 mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 519, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/7
+          Nov  3 15:09:30  nrj-sw1 chassisd[1288]: CHASSISD_POE_POWER_USAGE: PoE power usage at 31% of budget`,
+      },
+      { id: 'pc', type: 'pc', name: 'Office-PC', x: 110, y: 470, nic: { dhcp: true, offset: 21 } },
+      { id: 'prn', type: 'printer', name: 'printer', x: 290, y: 470, nic: { ip: '10.82.10.20/24', gw: '10.82.10.1' } },
+      { id: 'cam1', type: 'camera', name: 'workshop-cam', x: 500, y: 470, nic: { ip: '10.82.40.21/24', gw: '10.82.40.1' } },
+      { id: 'cam2', type: 'camera', name: 'showroom-cam', x: 690, y: 470, nic: { ip: '10.82.40.22/24', gw: '10.82.40.1' } },
+      { id: 'nvr', type: 'server', name: 'nvr01', x: 880, y: 470, nic: { ip: '10.82.40.5/24', gw: '10.82.40.1' } },
+    ],
+    links: [
+      ['inet:ge-0/0/0', 'fw:ge-0/0/0'], ['fw:ge-0/0/1', 'sw:ge-0/0/0'],
+      ['sw:ge-0/0/1', 'pc:eth0'], ['sw:ge-0/0/2', 'prn:eth0'], ['sw:ge-0/0/5', 'cam1:eth0'], ['sw:ge-0/0/6', 'cam2:eth0'], ['sw:ge-0/0/7', 'nvr:eth0'],
+    ],
+    checks: [
+      { label: 'Spec: VLAN CAMERAS is ID 40 with gateway irb.40 = 10.82.40.1/24', test: (net, RC) => { const m = net.dev.sw.model, v = m.vlans.CAMERAS, irb = m.ifaces.irb; return !!v && v.id === 40 && v.l3 === 'irb.40' && !!irb && !!irb.units['40'] && irb.units['40'].inet.includes('10.82.40.1/24'); } },
+      { label: 'Spec: ge-0/0/5, 0/6 and 0/7 are access ports in VLAN 40 only', test: (net, RC) => ['ge-0/0/5', 'ge-0/0/6', 'ge-0/0/7'].every(p => { const l2 = RC.portL2(net.dev.sw, p); return l2 && l2.mode === 'access' && l2.vlans.length === 1 && l2.vlans[0] === 40; }) },
+      { from: 'cam1', to: '10.82.40.5', label: 'workshop-cam → nvr01 (recording)' },
+      { from: 'cam2', to: '10.82.40.5', label: 'showroom-cam → nvr01 (recording)' },
+      { from: 'pc', to: '10.82.40.5', label: 'Office-PC → nvr01 (watching footage)' },
+      { from: 'pc', to: '10.82.10.20', label: 'Office-PC → printer (still works)' },
+      { from: 'pc', to: '8.8.8.8', label: 'Office-PC → Internet (still works)' },
+    ],
+    rca: {
+      question: 'Design review: why give the cameras their own VLAN instead of dropping them into OFFICE?',
+      options: [
+        { t: 'Higher VLAN IDs get forwarding priority, so video gets through faster.', ok: false },
+        { t: 'PoE only works on access ports that have no PCs in the same VLAN.', ok: false },
+        { t: 'It gives the cameras their own broadcast domain and subnet. Office broadcasts never reach them, a compromised camera can\'t see office traffic, and the switch routes only between the two subnets through the irb.', ok: true },
+        { t: 'The NVR needs its own VLAN so DHCP can give it a fixed address.', ok: false },
+      ],
+    },
+    hints: [
+      'Plan before you type. In the Notes tab, write: VLAN name and ID, subnet, gateway, and which ports move. Then build it top-down: VLAN, gateway, ports.',
+      'The VLAN and its gateway are three lines: set vlans CAMERAS vlan-id 40, set vlans CAMERAS l3-interface irb.40, set interfaces irb unit 40 family inet address 10.82.40.1/24.',
+      'Access ports take one VLAN, so swap, don\'t add. For each of ge-0/0/5, 0/6, 0/7: delete interfaces ge-0/0/5 unit 0 family ethernet-switching vlan members PARKING, then set ... vlan members CAMERAS. Run commit check, then commit.',
+    ],
+    debrief: [
+      'This is the everyday VLAN build: a name and ID, a Layer 3 gateway (the irb), and access ports moved into it. Nine lines, and the order you type them doesn\'t matter until commit.',
+      'The office PC can watch footage because both subnets end on the same switch. The irb interfaces route between them, no firewall trip needed.',
+      'Separate VLANs are about blast radius. Cameras are famously under-patched. On their own subnet they can\'t sniff office broadcasts, and a later firewall filter on irb.40 can lock them down further (that is Chapter 5 territory).',
+      'If you tried set ... vlan members CAMERAS without deleting PARKING first, commit check told you an access port has two VLANs. Junos adds to a list; it doesn\'t replace.',
+    ],
+    ninja: [{ tag: 'Checked before committing', say: 'commit check before commit. The careful blade is the fast blade.', test: (net, X) => X.ranCfg(/^commit check/) }],
+  },
+
+  {
+    id: 'D41', kind: 'drill', ticket: 'DRILL 4.1', priority: 'DRILL', sla: null, reward: 175, par: 99,
+    client: 'Agematsu Timber Co.', title: 'Reading the routing table',
+    reporter: 'JNCIA-aligned · Chapter 4',
+    topic: { area: 'the routing table and longest match', jncia: 'Routing Fundamentals', ccna: 'IP Connectivity' },
+    brief: 'The timber yard router has a handful of static routes, one of them added in a hurry. Read the table the way the router does: most specific match first, and ignore what can\'t be used.',
+    focus: 'rtr',
+    devices: [
+      { id: 'inet', type: 'cloud', name: 'Internet', hw: 'ISP edge', x: 220, y: 70, ports: ['ge-0/0/0'],
+        config: `
+          set system host-name isp-edge
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.1/30
+          set interfaces lo0 unit 0 family inet address 8.8.8.8/32
+          set routing-options static route 10.0.0.0/8 next-hop 203.0.113.2` },
+      { id: 'rtr', type: 'router', name: 'ags-rtr1', hw: 'srx320', x: 500, y: 200, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2'],
+        config: `
+          set system host-name ags-rtr1
+          set interfaces ge-0/0/0 description "ISP"
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.2/30
+          set interfaces ge-0/0/1 description "office LAN"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.88.10.1/24
+          set interfaces ge-0/0/2 description "to yard-rtr"
+          set interfaces ge-0/0/2 unit 0 family inet address 10.88.255.1/30
+          set interfaces lo0 unit 0 family inet address 10.88.0.1/32
+          set routing-options static route 0.0.0.0/0 next-hop 203.0.113.1
+          set routing-options static route 10.88.0.0/16 next-hop 10.88.255.2
+          set routing-options static route 10.88.40.0/24 next-hop 10.88.255.2
+          set routing-options static route 10.88.50.0/24 next-hop 10.88.25.2` },
+      { id: 'yard', type: 'router', name: 'yard-rtr', hw: 'srx300', x: 780, y: 300, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name yard-rtr
+          set interfaces ge-0/0/0 unit 0 family inet address 10.88.255.2/30
+          set interfaces ge-0/0/1 description "scale house"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.88.40.1/24
+          set routing-options static route 0.0.0.0/0 next-hop 10.88.255.1` },
+      { id: 'pc', type: 'pc', name: 'Office-PC', x: 330, y: 430, nic: { dhcp: true, offset: 21 } },
+      { id: 'scale', type: 'server', name: 'truck-scale', x: 780, y: 450, nic: { ip: '10.88.40.20/24', gw: '10.88.40.1' } },
+    ],
+    links: [['inet:ge-0/0/0', 'rtr:ge-0/0/0'], ['rtr:ge-0/0/1', 'pc:eth0'], ['rtr:ge-0/0/2', 'yard:ge-0/0/0'], ['yard:ge-0/0/1', 'scale:eth0']],
+    objectives: [
+      { t: 'Show the whole routing table', cmd: 'show route', test: X => X.ran(/^show route$/) },
+      { t: 'Ask the router which route it uses for 10.88.40.20', cmd: 'show route 10.88.40.20', test: X => X.ran(/^show route 10\.88\.40\.20$/) },
+      { t: 'Three routes cover 10.88.40.20. Which one wins?', ask: ['0.0.0.0/0', '10.88.0.0/16', '10.88.40.0/24', 'The one added first'], ok: 2 },
+      { t: 'List the routes Junos refuses to use', cmd: 'show route hidden', test: X => X.ran(/^show route hidden/) },
+      { t: 'Why is 10.88.50.0/24 hidden?', ask: ['Its preference is too high', 'Its next hop, 10.88.25.2, is not on any connected subnet', 'A /24 can\'t coexist with a /16', 'ge-0/0/2 is disabled'], ok: 1 },
+      { t: 'Show only the static routes', cmd: 'show route protocol static', test: X => X.ran(/^show route protocol static/) },
+    ],
+    hints: [
+      'show route 10.88.40.20 (an address, not a prefix) shows the single route the router would actually use.',
+      'Longest match: the route with the longest prefix length that still contains the address wins, before preference is even considered.',
+      'A static route whose next hop isn\'t on a directly connected subnet can\'t be resolved, so Junos hides it. Compare 10.88.25.2 to the interface addresses.',
+    ],
+    debrief: [
+      'Routers pick a route in two steps. First, the most specific prefix that contains the destination (longest match). Only if two routes have the same prefix does preference decide.',
+      '10.88.40.20 is inside 0.0.0.0/0, 10.88.0.0/16 and 10.88.40.0/24. The /24 wins. If it disappeared, the /16 would take over, then the default.',
+      'Hidden routes are configured but unusable, usually because the next hop isn\'t reachable on a connected subnet. A typo like 10.88.25.2 for 10.88.255.2 hides a route silently. show route hidden is the first place to look when a route you configured "isn\'t there."',
+      'In each entry, [Static/5] is protocol and preference. Direct and Local are 0, static is 5, OSPF internal is 10. Lower is better.',
+    ],
+  },
+
+  {
+    id: 'D42', kind: 'drill', ticket: 'DRILL 4.2', priority: 'DRILL', sla: null, reward: 175, par: 99,
+    client: 'Hirasawa Lacquer Guild', title: 'A route on the bench',
+    reporter: 'JNCIA-aligned · Chapter 4',
+    topic: { area: 'static routes and route preference', jncia: 'Routing Fundamentals', ccna: 'IP Connectivity' },
+    brief: 'The guild has fiber and a cheap LTE modem. Right now only the fiber has a default route. Add the LTE as a standby route that only wakes up when the fiber route goes away.',
+    focus: 'rtr',
+    devices: [
+      { id: 'inet', type: 'cloud', name: 'Fiber ISP', hw: 'ISP edge', x: 290, y: 70, ports: ['ge-0/0/0'],
+        config: `
+          set system host-name fiber-isp
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.1/30
+          set interfaces lo0 unit 0 family inet address 8.8.8.8/32
+          set routing-options static route 10.0.0.0/8 next-hop 203.0.113.2` },
+      { id: 'lte', type: 'cloud', name: 'LTE carrier', hw: 'LTE modem', x: 710, y: 70, ports: ['ge-0/0/0'],
+        config: `
+          set system host-name lte-carrier
+          set interfaces ge-0/0/0 unit 0 family inet address 198.51.100.1/29
+          set interfaces lo0 unit 0 family inet address 8.8.8.8/32
+          set routing-options static route 10.0.0.0/8 next-hop 198.51.100.2` },
+      { id: 'rtr', type: 'router', name: 'hrs-rtr1', hw: 'srx300', x: 500, y: 230, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2'],
+        config: `
+          set system host-name hrs-rtr1
+          set interfaces ge-0/0/0 description "fiber"
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.2/30
+          set interfaces ge-0/0/1 description "guild LAN"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.87.10.1/24
+          set interfaces ge-0/0/2 description "LTE modem"
+          set interfaces ge-0/0/2 unit 0 family inet address 198.51.100.2/29
+          set routing-options static route 0.0.0.0/0 next-hop 203.0.113.1` },
+      { id: 'pc', type: 'pc', name: 'Guild-PC', x: 500, y: 440, nic: { dhcp: true, offset: 21 } },
+    ],
+    links: [['inet:ge-0/0/0', 'rtr:ge-0/0/0'], ['lte:ge-0/0/0', 'rtr:ge-0/0/2'], ['rtr:ge-0/0/1', 'pc:eth0']],
+    objectives: [
+      { t: 'Look at the default route', cmd: 'show route 0.0.0.0/0', test: X => X.ran(/^show route 0\.0\.0\.0\/0$/) },
+      { t: 'Add the LTE modem (198.51.100.1) as a standby next hop with preference 10', cmd: 'set routing-options static route 0.0.0.0/0 qualified-next-hop 198.51.100.1 preference 10', test: X => X.cand('rtr', /static route 0\.0\.0\.0\/0 qualified-next-hop 198\.51\.100\.1 preference 10$/) },
+      { t: 'Commit it', cmd: 'commit', test: X => X.has('rtr', 'set routing-options static route 0.0.0.0/0 qualified-next-hop 198.51.100.1 preference 10') },
+      { t: 'Look at the default route again', cmd: 'show route 0.0.0.0/0', test: X => X.has('rtr', 'set routing-options static route 0.0.0.0/0 qualified-next-hop 198.51.100.1 preference 10') && X.after(X.idx(/^commit/, true), c => /^show route 0\.0\.0\.0\/0$/.test(c.key)) },
+      { t: 'Which route is active (*) now?', ask: ['Fiber, 203.0.113.1, preference 5', 'LTE, 198.51.100.1, preference 10', 'Both, sharing the load'], ok: 0 },
+      { t: 'If the fiber link drops, what happens to the LTE route?', ask: ['Nothing until someone edits the config', 'It becomes active on its own, because the preference 5 route is gone', 'Junos lowers its preference to 5'], ok: 1 },
+    ],
+    hints: [
+      'qualified-next-hop is a next hop with its own settings. The preference goes after the address.',
+      'From operational mode, configure (or edit) first. After commit, run show route 0.0.0.0/0 from config mode with run in front, or exit first.',
+      'The star (*) marks the active route. The other one sits there, ready.',
+    ],
+    debrief: [
+      'This is a floating static route. Both routes are in the table; only the lowest preference is active. When the fiber interface goes down, its route can\'t resolve, drops out, and the preference 10 route takes over without anyone touching the config.',
+      'Two plain next-hop statements would make one route with two equal next hops. That is load sharing, not a backup. The qualified-next-hop is what lets the LTE carry a different preference.',
+      'The catch with floating statics: they only react to the local link going down. If the ISP breaks two hops away, the fiber port stays up and the backup never wakes. Real designs add probes (Junos RPM with ip-monitoring) for that.',
+    ],
+  },
+
+  {
+    id: 'D43', kind: 'drill', ticket: 'DRILL 4.3', priority: 'DRILL', sla: null, reward: 175, par: 99,
+    client: 'Nagiso Woodcraft', title: 'First look at OSPF',
+    reporter: 'JNCIA-aligned · Chapter 4',
+    topic: { area: 'dynamic routing with OSPF', jncia: 'Routing Fundamentals', ccna: 'IP Connectivity' },
+    brief: 'The showroom and the workshop each have a router, and the two routers trade routes with OSPF. Nothing is broken. Learn what healthy looks like, so broken stands out later.',
+    focus: 'r1',
+    devices: [
+      { id: 'r1', type: 'router', name: 'ngs-rtr1', hw: 'srx300', x: 300, y: 220, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name ngs-rtr1
+          set interfaces ge-0/0/0 description "to workshop"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.89.255.1/30
+          set interfaces ge-0/0/1 description "showroom LAN"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.89.10.1/24
+          set interfaces lo0 unit 0 family inet address 10.89.0.1/32
+          set protocols ospf area 0.0.0.0 interface ge-0/0/0.0
+          set protocols ospf area 0.0.0.0 interface ge-0/0/1.0 passive
+          set protocols ospf area 0.0.0.0 interface lo0.0 passive` },
+      { id: 'r2', type: 'router', name: 'ngs-rtr2', hw: 'srx300', x: 700, y: 220, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name ngs-rtr2
+          set interfaces ge-0/0/0 description "to showroom"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.89.255.2/30
+          set interfaces ge-0/0/1 description "workshop LAN"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.89.20.1/24
+          set interfaces lo0 unit 0 family inet address 10.89.0.2/32
+          set protocols ospf area 0.0.0.0 interface ge-0/0/0.0
+          set protocols ospf area 0.0.0.0 interface ge-0/0/1.0 passive
+          set protocols ospf area 0.0.0.0 interface lo0.0 passive` },
+      { id: 'pc1', type: 'pc', name: 'Showroom-PC', x: 300, y: 440, nic: { dhcp: true, offset: 21 } },
+      { id: 'pc2', type: 'pc', name: 'Workshop-PC', x: 700, y: 440, nic: { dhcp: true, offset: 21 } },
+    ],
+    links: [['r1:ge-0/0/0', 'r2:ge-0/0/0'], ['r1:ge-0/0/1', 'pc1:eth0'], ['r2:ge-0/0/1', 'pc2:eth0']],
+    objectives: [
+      { t: 'See who your OSPF neighbors are', cmd: 'show ospf neighbor', test: X => X.ran(/^show ospf neighbor/) },
+      { t: 'What state is the neighbor in?', ask: ['Init', '2Way', 'ExStart', 'Full'], ok: 3 },
+      { t: 'See which interfaces run OSPF, and in which area', cmd: 'show ospf interface', test: X => X.ran(/^show ospf interface/) },
+      { t: 'Show only the routes learned from OSPF', cmd: 'show route protocol ospf', test: X => X.ran(/^show route protocol ospf/) },
+      { t: 'The workshop LAN shows [OSPF/10]. What is the 10?', ask: ['The metric (cost)', 'The route preference: lower wins', 'The area number', 'The number of hops'], ok: 1 },
+      { t: 'Find where OSPF lives in the config', cmd: 'show configuration protocols ospf', test: X => X.ran(/^show configuration protocols ospf/) },
+    ],
+    hints: [
+      'Everything OSPF in operational mode starts with show ospf. Tab is your friend.',
+      'Full is the goal. It means the two routers have synchronized their link-state databases.',
+      'The number after the slash in [OSPF/10] is preference, the same idea as [Static/5]. The metric is printed separately.',
+    ],
+    debrief: [
+      'OSPF neighbors say hello on each link. If they agree on the basics (same subnet, same area, matching timers and MTU), they exchange databases and reach Full. Only then do routes flow.',
+      'Passive interfaces are advertised but don\'t send hellos. LANs with only PCs on them and loopbacks are usually passive: you want their subnets known, but there\'s no router there to talk to.',
+      'OSPF internal routes have preference 10, higher than static\'s 5. If someone leaves an old static route for the same prefix, it wins. Hold that thought for the JNCIS path.',
+      'Each router\'s loopback (lo0) address doubles as its router ID, which is why you see 10.89.0.x in the neighbor ID column.',
+    ],
+  },
+
+  {
+    id: 'C4T1', ticket: 'TKT-1164', priority: 'P2', sla: 20, reward: 700, par: 2,
+    client: 'Kiso-Fukushima Family Clinic', title: 'New wing can\'t open patient records',
+    reporter: 'Dr. Mori, Clinic Director',
+    topic: { area: 'static routing and hidden routes', jncia: 'Routing Fundamentals', ccna: 'IP Connectivity' },
+    brief: 'The new exam wing opened Monday with its own small router. Exam-1-PC gets an address and the nurse can print to the wing\'s own network, but patient records (records01 in the main building) won\'t load and neither will the Internet. A contractor added "the route to the wing" on the core switch on Friday.',
+    quotes: [
+      ['Dr. Mori', 'We\'re writing notes on paper in a brand-new wing. It is embarrassing.'],
+      ['Contractor (email)', 'Route added on kfc-core, tested from the wing router itself. Should be good to go.'],
+      ['Nurse', 'The computer says it has network. It just never finishes loading anything.'],
+    ],
+    focus: 'exam',
+    villain: 'A single digit. That\'s all it takes. I love contractors who test from the wrong end. Heh heh.',
+    heat: {
+      devs: { core: 2, wing: 1, exam: 1, fw: -1, rec: -1, front: -2 },
+      clues: [
+        { dev: 'exam', re: /^ipconfig/, h: 1, say: ['Real address, real gateway. The wing side looks okay.'] },
+        { dev: 'exam', re: /^(ping|tracert)/, h: 1, say: ['Gets out, never comes home. Who sends the replies back?'] },
+        { dev: 'core', re: /^show route hidden/, h: 3, say: ['THERE it is. Look at that next hop real close.', 'Hidden! Now why would Junos hide it?'] },
+        { dev: 'core', re: /^show route 10\.84\.30/, h: 2, say: ['Not what you expected, huh? Where\'s the route to the wing?'] },
+        { dev: 'core', re: /^show configuration .*routing-options|^show configuration( \| display set)?$/, h: 2 },
+        { dev: 'core', re: /^show route/, h: 2 },
+        { dev: 'core', re: /^(set|delete) routing-options static route 10\.84\.30\.0\/24/, h: 3, say: ['Commit it and test from the wing.'] },
+        { dev: 'core', re: /^show log/, h: 2, say: ['The contractor\'s commit is in there.'] },
+        { dev: 'wing', re: /^show route/, h: 1, say: ['The wing router\'s routes look fine. What about the core\'s?'] },
+        { dev: 'wing', re: /^ping 10\.84\.255\.5/, h: 1, say: ['The link\'s fine. That\'s what the contractor tested, too.'] },
+        { dev: 'fw', re: /./, h: -1, say: ['The firewall sends all of 10.84/16 to the core. Ask the core where it goes next.'] },
+        { dev: ['front', 'rec'], re: /./, h: -2, say: ['The main building\'s fine. Go stand in the new wing.'] },
+      ],
+    },
+    devices: [
+      ISP_CLOUD(),
+      {
+        id: 'fw', type: 'firewall', name: 'kfc-fw', hw: 'srx300', x: 380, y: 160, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name kfc-fw
+          set interfaces ge-0/0/0 description "ISP uplink"
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.2/30
+          set interfaces ge-0/0/1 description "to kfc-core"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.0.255.1/30
+          set routing-options static route 0.0.0.0/0 next-hop 203.0.113.1
+          set routing-options static route 10.84.0.0/16 next-hop 10.0.255.2`,
+      },
+      {
+        id: 'core', type: 'switch', name: 'kfc-core', hw: 'ex2300-24p', x: 380, y: 300, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2', 'ge-0/0/10'],
+        config: `
+          set system host-name kfc-core
+          set interfaces ge-0/0/0 description "uplink to kfc-fw"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.0.255.2/30
+          set interfaces ge-0/0/1 description "records01"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members SERVERS
+          set interfaces ge-0/0/2 description "front desk"
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members OFFICE
+          set interfaces ge-0/0/10 description "to kfc-wing-rtr"
+          set interfaces ge-0/0/10 unit 0 family inet address 10.84.255.5/30
+          set interfaces irb unit 10 family inet address 10.84.10.1/24
+          set interfaces irb unit 20 family inet address 10.84.20.1/24
+          set vlans OFFICE vlan-id 10
+          set vlans OFFICE l3-interface irb.10
+          set vlans SERVERS vlan-id 20
+          set vlans SERVERS l3-interface irb.20
+          set routing-options static route 0.0.0.0/0 next-hop 10.0.255.1
+          set routing-options static route 10.84.30.0/24 next-hop 10.84.225.6`,
+        logs: `
+          Oct 31 16:40:12  kfc-core mgd[4410]: UI_LOGIN_EVENT: User 'contractor' login, class 'j-super-user'
+          Oct 31 16:44:51  kfc-core mgd[4410]: UI_CFG_AUDIT_SET: User 'contractor' set: [interfaces ge-0/0/10 unit 0 family inet address] 10.84.255.5/30
+          Oct 31 16:45:30  kfc-core mgd[4410]: UI_CFG_AUDIT_SET: User 'contractor' set: [routing-options static route 10.84.30.0/24 next-hop] 10.84.225.6
+          Oct 31 16:45:41  kfc-core mgd[4410]: UI_COMMIT: User 'contractor' requested 'commit' operation (comment: link + route to new wing)
+          Oct 31 16:46:02  kfc-core mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 530, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/10`,
+      },
+      {
+        id: 'wing', type: 'router', name: 'kfc-wing-rtr', hw: 'srx300', x: 720, y: 300, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name kfc-wing-rtr
+          set interfaces ge-0/0/0 description "to kfc-core"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.84.255.6/30
+          set interfaces ge-0/0/1 description "exam rooms"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.84.30.1/24
+          set routing-options static route 0.0.0.0/0 next-hop 10.84.255.5`,
+      },
+      { id: 'rec', type: 'server', name: 'records01', x: 160, y: 470, nic: { ip: '10.84.20.10/24', gw: '10.84.20.1' } },
+      { id: 'front', type: 'pc', name: 'FrontDesk-PC', x: 400, y: 470, nic: { dhcp: true, offset: 21 } },
+      { id: 'exam', type: 'pc', name: 'Exam-1-PC', x: 720, y: 470, nic: { dhcp: true, offset: 20 } },
+    ],
+    links: [
+      ['inet:ge-0/0/0', 'fw:ge-0/0/0'], ['fw:ge-0/0/1', 'core:ge-0/0/0'],
+      ['core:ge-0/0/1', 'rec:eth0'], ['core:ge-0/0/2', 'front:eth0'], ['core:ge-0/0/10', 'wing:ge-0/0/0'], ['wing:ge-0/0/1', 'exam:eth0'],
+    ],
+    checks: [
+      { from: 'exam', to: '10.84.20.10', label: 'Exam-1-PC → records01 (patient records)' },
+      { from: 'exam', to: '8.8.8.8', label: 'Exam-1-PC → Internet' },
+      { from: 'front', to: '10.84.20.10', label: 'FrontDesk-PC → records01 (still works)' },
+      { from: 'front', to: '8.8.8.8', label: 'FrontDesk-PC → Internet (still works)' },
+    ],
+    rca: {
+      question: 'What was the root cause?',
+      options: [
+        { t: 'The wing router has no default route, so the wing can\'t send traffic out.', ok: false },
+        { t: 'The core\'s static route for 10.84.30.0/24 used next hop 10.84.225.6, a typo for 10.84.255.6. That address isn\'t on any connected subnet, so Junos hid the route and replies to the wing bounced between the core and the firewall until they expired.', ok: true },
+        { t: 'records01 blocks connections from unknown subnets.', ok: false },
+        { t: 'The link between kfc-core and kfc-wing-rtr is down.', ok: false },
+      ],
+    },
+    hints: [
+      'Exam-1-PC has a good address and reaches its gateway, so the wing side is fine. Follow the reply instead: on kfc-core, run show route 10.84.30.20. Where would the core send it?',
+      'The route the contractor added doesn\'t appear in the normal table. Look for routes Junos refuses to use: show route hidden. Compare the next hop with the core\'s interfaces (show interfaces terse).',
+      'In config mode on kfc-core: delete routing-options static route 10.84.30.0/24 next-hop 10.84.225.6, then set routing-options static route 10.84.30.0/24 next-hop 10.84.255.6. Commit.',
+    ],
+    debrief: [
+      'The contractor typed 10.84.225.6 instead of 10.84.255.6. A next hop has to sit on a directly connected subnet, so Junos kept the route but marked it hidden. No error, no alarm.',
+      'Requests from the wing reached records01 fine. The replies were the problem: the core had no usable route to 10.84.30.0/24, so it used its default route toward the firewall. The firewall sends all of 10.84.0.0/16 back to the core. The packets ping-ponged until their TTL ran out.',
+      'The contractor "tested" by pinging from the wing router to the core\'s link address. That address is on a connected subnet on both ends, so it never touched the broken route. Always test from the user\'s seat, to the thing they need.',
+      'show route hidden is a two-second check that saves an hour. Any time a route you configured "isn\'t there," look there first.',
+    ],
+    ninja: [{ tag: 'Found the hidden route', say: 'You looked where routes go to hide. Few think to.', test: (net, X) => X.ran(/^show route hidden/) }],
+  },
+
+  {
+    id: 'C4T2', ticket: 'TKT-1178', priority: 'P2', sla: 20, reward: 700, par: 1,
+    client: 'Kaida Highland Dairy', title: 'The feed scale went quiet',
+    reporter: 'Mr. Kaida, Owner',
+    topic: { area: 'longest-prefix match', jncia: 'Routing Fundamentals', ccna: 'IP Connectivity' },
+    brief: 'Last week the old barn router died and a new one went in. The milking parlor PC works great. The feed scale in the barn hasn\'t sent a weight to the office since the swap, and its cloud sync is failing too. Both are behind the same new router.',
+    quotes: [
+      ['Mr. Kaida', 'The cows don\'t care, but my feed bill does. I need those numbers.'],
+      ['Kenta (farm hand)', 'I set up the new router like the note said. I even added one big route on the office switch so everything in the barn goes to it.'],
+      ['Note taped to the old router', 'Barn router 10.86.255.10 — do not unplug!'],
+    ],
+    focus: 'pc',
+    villain: 'Old routes never die. They just wait. Mwa-ha-ha.',
+    heat: {
+      devs: { core: 2, barn: 1, pc: 1, scale: 1, parlor: -1, fw: -2 },
+      clues: [
+        { dev: 'core', re: /^show route 10\.86\.50/, h: 3, say: ['A /24 AND a /16. Which one is more specific?', 'Look where that /24 goes. Is anybody home at that address?'] },
+        { dev: 'core', re: /^show route 10\.86\.60/, h: 1, say: ['The parlor works. Compare it to the scale.'] },
+        { dev: 'core', re: /^show arp/, h: 3, say: ['Count the neighbors on 10.86.255.8/29. Who\'s missing?'] },
+        { dev: 'core', re: /^show route/, h: 2 },
+        { dev: 'core', re: /^show configuration/, h: 2 },
+        { dev: 'core', re: /^delete routing-options static route 10\.86\.50\.0\/24/, h: 3, say: ['Clean cut. Commit.'] },
+        { dev: 'core', re: /^show log/, h: 1 },
+        { dev: 'barn', re: /^show route/, h: 1, say: ['The new barn router knows both LANs fine. Look upstream.'] },
+        { dev: 'barn', re: /./, h: 1 },
+        { dev: ['pc', 'scale'], re: /^(ping|tracert|traceroute)/, h: 1 },
+        { dev: 'parlor', re: /./, h: -1, say: ['The parlor\'s happy. It\'s the scale that\'s sulking.'] },
+        { dev: 'fw', re: /./, h: -2, say: ['The firewall\'s not the one with old routes.'] },
+      ],
+    },
+    devices: [
+      ISP_CLOUD(),
+      {
+        id: 'fw', type: 'firewall', name: 'kdd-fw', hw: 'srx300', x: 360, y: 160, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name kdd-fw
+          set interfaces ge-0/0/0 description "ISP uplink"
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.2/30
+          set interfaces ge-0/0/1 description "to kdd-core"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.0.255.1/30
+          set routing-options static route 0.0.0.0/0 next-hop 203.0.113.1
+          set routing-options static route 10.86.0.0/16 next-hop 10.0.255.2`,
+      },
+      {
+        id: 'core', type: 'switch', name: 'kdd-core', hw: 'ex2300-c-12p', x: 360, y: 300, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/8'],
+        config: `
+          set system host-name kdd-core
+          set interfaces ge-0/0/0 description "uplink to kdd-fw"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.0.255.2/30
+          set interfaces ge-0/0/1 description "office pc"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members OFFICE
+          set interfaces ge-0/0/8 description "to barn router"
+          set interfaces ge-0/0/8 unit 0 family inet address 10.86.255.9/29
+          set interfaces irb unit 10 family inet address 10.86.10.1/24
+          set vlans OFFICE vlan-id 10
+          set vlans OFFICE l3-interface irb.10
+          set routing-options static route 0.0.0.0/0 next-hop 10.0.255.1
+          set routing-options static route 10.86.50.0/24 next-hop 10.86.255.10
+          set routing-options static route 10.86.0.0/16 next-hop 10.86.255.11`,
+        commits: [
+          { user: 'kenta', when: '2026-10-28 18:20:05', comment: 'new barn router - route all barn subnets' },
+          { user: 'admin', when: '2024-06-02 11:02:44', comment: 'feed scale subnet via barn router', undo: { remove: ['set routing-options static route 10.86.0.0/16 next-hop 10.86.255.11'] } },
+        ],
+        logs: `
+          Oct 28 17:51:20  kdd-core mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 520, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/8
+          Oct 28 18:12:47  kdd-core mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 520, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/8
+          Oct 28 18:19:58  kdd-core mgd[4410]: UI_CFG_AUDIT_SET: User 'kenta' set: [routing-options static route 10.86.0.0/16 next-hop] 10.86.255.11
+          Oct 28 18:20:05  kdd-core mgd[4410]: UI_COMMIT: User 'kenta' requested 'commit' operation (comment: new barn router - route all barn subnets)`,
+      },
+      {
+        id: 'barn', type: 'router', name: 'kdd-barn-rtr', hw: 'srx300', x: 700, y: 300, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2'],
+        config: `
+          set system host-name kdd-barn-rtr
+          set interfaces ge-0/0/0 description "to kdd-core"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.86.255.11/29
+          set interfaces ge-0/0/1 description "feed scale"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.86.50.1/24
+          set interfaces ge-0/0/2 description "milking parlor"
+          set interfaces ge-0/0/2 unit 0 family inet address 10.86.60.1/24
+          set routing-options static route 0.0.0.0/0 next-hop 10.86.255.9`,
+      },
+      { id: 'pc', type: 'pc', name: 'Office-PC', x: 360, y: 470, nic: { dhcp: true, offset: 21 } },
+      { id: 'scale', type: 'server', name: 'feed-scale', x: 610, y: 470, nic: { ip: '10.86.50.30/24', gw: '10.86.50.1' } },
+      { id: 'parlor', type: 'pc', name: 'Parlor-PC', x: 820, y: 470, nic: { dhcp: true, offset: 20 } },
+    ],
+    links: [
+      ['inet:ge-0/0/0', 'fw:ge-0/0/0'], ['fw:ge-0/0/1', 'core:ge-0/0/0'], ['core:ge-0/0/1', 'pc:eth0'],
+      ['core:ge-0/0/8', 'barn:ge-0/0/0'], ['barn:ge-0/0/1', 'scale:eth0'], ['barn:ge-0/0/2', 'parlor:eth0'],
+    ],
+    checks: [
+      { from: 'pc', to: '10.86.50.30', label: 'Office-PC → feed-scale (weights)' },
+      { from: 'scale', to: '8.8.8.8', label: 'feed-scale → Internet (cloud sync)' },
+      { from: 'parlor', to: '10.86.10.21', label: 'Parlor-PC → Office-PC (still works)' },
+      { from: 'pc', to: '8.8.8.8', label: 'Office-PC → Internet (still works)' },
+    ],
+    rca: {
+      question: 'What was the root cause?',
+      options: [
+        { t: 'The new barn router is missing a route back to the office.', ok: false },
+        { t: 'The feed scale has the wrong default gateway.', ok: false },
+        { t: 'Kenta\'s 10.86.0.0/16 route has a typo in the next hop.', ok: false },
+        { t: 'A leftover static route for 10.86.50.0/24 still pointed at the dead barn router (10.86.255.10). A /24 is more specific than the new /16, so longest match kept sending scale traffic to a router that no longer exists.', ok: true },
+      ],
+    },
+    hints: [
+      'Parlor (10.86.60.x) works, scale (10.86.50.x) doesn\'t, same new router. On kdd-core, compare show route 10.86.50.30 with show route 10.86.60.20.',
+      'Longest match wins: a /24 beats a /16 no matter which is newer. Is 10.86.255.10 still alive? show arp no-resolve on kdd-core.',
+      'The /16 already covers the scale subnet through the new router. Remove the stale route: delete routing-options static route 10.86.50.0/24. Commit.',
+    ],
+    debrief: [
+      'Two years ago someone added 10.86.50.0/24 via the old barn router at 10.86.255.10. Kenta added a broad 10.86.0.0/16 via the new router at .11, which covers everything in the barn.',
+      'Longest match is checked before anything else. For 10.86.50.30, the /24 is more specific than the /16, so the core kept using the old route. Its next hop was still on a connected subnet, so Junos considered it perfectly valid. Nothing answered ARP at .10, and packets died quietly.',
+      'The parlor\'s 10.86.60.0/24 only matched the /16, so it worked, which made the problem look like "something about the scale."',
+      'When you replace a device, search the config for its old address: show configuration | display set | match 10.86.255.10. Old routes are the most common leftovers.',
+    ],
+    ninja: [{ tag: 'Checked the next hop was alive', say: 'You asked ARP whether the next hop still breathes. A route is only as good as its next hop.', test: (net, X) => X.ran(/^show arp/, 'core') }],
+  },
+
+  /* ================= JNCIS-aligned path (Nov 4) ================= */
+  {
+    id: 'IS1', ticket: 'TKT-2104', priority: 'P1', sla: 20, reward: 1000, par: 2,
+    client: 'Kurobe Gorge Rail Café', title: 'The backup line never kicked in',
+    reporter: 'Aiko, Café Manager',
+    topic: { area: 'floating static routes and qualified next hops', jncis: 'Protocol Independent Routing', ccna: 'IP Connectivity' },
+    brief: 'A snowplow took out the fiber pole at 6 a.m. The carrier says repairs tomorrow. The café paid for an LTE backup that is "fully automatic," but card payments have been failing all morning and the tourist train arrives at noon.',
+    quotes: [
+      ['Aiko', 'Cash only, on a tourist train day. Please.'],
+      ['Old IT notes', 'LTE failover configured and tested. Modem lives at the top of the /29.'],
+      ['LTE carrier (welcome email)', 'Your static block is 198.51.100.0/29. Your gateway is 198.51.100.1.'],
+    ],
+    focus: 'pos',
+    villain: '"Fully automatic." My favorite two words. Right after "tested." Heh heh heh.',
+    heat: {
+      devs: { rtr: 2, sw: -1, pos: 1, kiosk: 1, office: 1, inet: -2, lte: -1 },
+      clues: [
+        { dev: 'rtr', re: /^show route (0\.0\.0\.0\/0|8\.8\.8\.8)/, h: 2, say: ['The backup IS active. So why is nothing getting through?', 'Look at that next hop. Who lives there?'] },
+        { dev: 'rtr', re: /^show arp/, h: 3, say: ['One neighbor on the LTE subnet. Is it the one in your route?'] },
+        { dev: 'rtr', re: /^ping 198\.51\.100\.1/, h: 3, say: ['THAT answers. Now, is it the next hop in the route?'] },
+        { dev: 'rtr', re: /^ping 198\.51\.100\.6/, h: 3, say: ['Silence. Nobody home at .6.'] },
+        { dev: 'rtr', re: /^show interfaces (terse|ge-0\/0\/0)/, h: 1, say: ['Yep, the fiber\'s dead. We knew that. Why isn\'t LTE carrying the load?'] },
+        { dev: 'rtr', re: /^show configuration/, h: 2 },
+        { dev: 'rtr', re: /qualified-next-hop 198\.51\.100\.1/, h: 3, say: ['Right gateway. Keep the preference higher than the fiber\'s!'] },
+        { dev: 'rtr', re: /^show route$/, h: 1 },
+        { dev: 'rtr', re: /^show log/, h: 1, say: ['Link down, sure. Logs won\'t tell you the next hop\'s wrong.'] },
+        { dev: 'sw', re: /./, h: -1, say: ['The switch is just passing frames. The decision\'s made upstairs.'] },
+        { dev: ['pos', 'kiosk', 'office'], re: /^ipconfig/, h: 1, say: ['Addresses are fine. The problem\'s past the gateway.'] },
+        { dev: ['inet', 'lte'], re: /./, h: -2 },
+      ],
+    },
+    devices: [
+      { id: 'inet', type: 'cloud', name: 'Fiber ISP', hw: 'ISP edge', x: 290, y: 60, ports: ['ge-0/0/0'],
+        config: `
+          set system host-name fiber-isp
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.1/30
+          set interfaces lo0 unit 0 family inet address 8.8.8.8/32
+          set routing-options static route 10.0.0.0/8 next-hop 203.0.113.2` },
+      { id: 'lte', type: 'cloud', name: 'LTE carrier', hw: 'LTE modem', x: 710, y: 60, ports: ['ge-0/0/0'],
+        config: `
+          set system host-name lte-carrier
+          set interfaces ge-0/0/0 unit 0 family inet address 198.51.100.1/29
+          set interfaces lo0 unit 0 family inet address 8.8.8.8/32
+          set routing-options static route 10.0.0.0/8 next-hop 198.51.100.2` },
+      {
+        id: 'rtr', type: 'router', name: 'krb-rtr1', hw: 'srx300', x: 500, y: 180, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2'],
+        config: `
+          set system host-name krb-rtr1
+          set interfaces ge-0/0/0 description "fiber - Hokuriku Net"
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.2/30
+          set interfaces ge-0/0/1 description "cafe LAN"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.92.10.1/24
+          set interfaces ge-0/0/2 description "LTE backup modem"
+          set interfaces ge-0/0/2 unit 0 family inet address 198.51.100.2/29
+          set routing-options static route 0.0.0.0/0 next-hop 203.0.113.1
+          set routing-options static route 0.0.0.0/0 qualified-next-hop 198.51.100.6 preference 10`,
+        logs: `
+          Nov  4 05:58:13  krb-rtr1 mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 513, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/0
+          Nov  4 05:58:13  krb-rtr1 rpd[1612]: RPD_KRT_KERNEL_BAD_ROUTE: KRT: lost ifl 72 for route 0.0.0.0/0
+          Nov  4 06:30:02  krb-rtr1 RT_FLOW: RT_FLOW_SESSION_CREATE: session created 10.92.10.31/50211->52.96.166.130/443 junos-https
+          Nov  4 06:30:05  krb-rtr1 RT_FLOW: RT_FLOW_SESSION_CLOSE: session closed unset: 10.92.10.31/50211->52.96.166.130/443 junos-https`,
+      },
+      { id: 'sw', type: 'switch', name: 'krb-sw1', hw: 'ex2300-c-12p', x: 500, y: 320, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2', 'ge-0/0/3'],
+        config: `
+          set system host-name krb-sw1
+          set interfaces ge-0/0/0 description "to krb-rtr1"
+          set interfaces ge-0/0/1 description "POS terminal"
+          set interfaces ge-0/0/2 description "ticket kiosk"
+          set interfaces ge-0/0/3 description "back office"` },
+      { id: 'pos', type: 'pc', name: 'POS-Terminal', x: 260, y: 470, nic: { dhcp: true, offset: 31 } },
+      { id: 'kiosk', type: 'laptop', name: 'Ticket-Kiosk', x: 500, y: 470, nic: { dhcp: true, offset: 32 } },
+      { id: 'office', type: 'pc', name: 'Office-PC', x: 740, y: 470, nic: { dhcp: true, offset: 33 } },
+    ],
+    links: [
+      ['inet:ge-0/0/0', 'rtr:ge-0/0/0', { cut: true }], ['lte:ge-0/0/0', 'rtr:ge-0/0/2'], ['rtr:ge-0/0/1', 'sw:ge-0/0/0'],
+      ['sw:ge-0/0/1', 'pos:eth0'], ['sw:ge-0/0/2', 'kiosk:eth0'], ['sw:ge-0/0/3', 'office:eth0'],
+    ],
+    checks: [
+      { from: 'pos', to: '8.8.8.8', via: 'lte', label: 'POS-Terminal → card processor over LTE (fiber still down)' },
+      { from: 'kiosk', to: '8.8.8.8', label: 'Ticket-Kiosk → Internet' },
+      { from: 'pos', to: '8.8.8.8', restore: ['rtr:ge-0/0/0'], via: 'inet', label: 'Tomorrow, fiber repaired: traffic moves back to fiber by itself' },
+    ],
+    rca: {
+      question: 'What was the root cause?',
+      options: [
+        { t: 'The LTE route needed preference 5 to match the fiber route.', ok: false },
+        { t: 'The backup route\'s qualified next hop was 198.51.100.6, but the LTE gateway is 198.51.100.1. Because .6 is inside the /29, the route looked valid and became active, but nothing answered ARP there, so every packet died.', ok: true },
+        { t: 'Junos can\'t fail over static routes. Only a dynamic protocol can do that.', ok: false },
+        { t: 'The LTE modem needs a route back to the café LAN.', ok: false },
+      ],
+    },
+    hints: [
+      'The fiber is down, so the preference 10 route should now be active. On krb-rtr1: show route 0.0.0.0/0. Is it active? Which next hop?',
+      'An active route only helps if something lives at its next hop. show arp no-resolve on krb-rtr1, and compare with the carrier\'s welcome email.',
+      'Swap the next hop: delete routing-options static route 0.0.0.0/0 qualified-next-hop 198.51.100.6, then set routing-options static route 0.0.0.0/0 qualified-next-hop 198.51.100.1 preference 10. Commit.',
+    ],
+    debrief: [
+      'The failover logic was right: fiber at preference 5, LTE as a qualified next hop at preference 10. When the fiber link dropped, the fiber route became unusable and the LTE route went active exactly as designed.',
+      'The address was wrong. "Top of the /29" became .6 (the last usable host), but the carrier\'s gateway is .1. Because .6 is inside the connected /29, Junos had no reason to hide the route. Unlike JNCIA\'s hidden-route typo, this one looks perfectly healthy in show route.',
+      'show arp is how you catch it: the only neighbor on 198.51.100.0/29 is .1. A next hop that never shows up in ARP is a next hop that doesn\'t exist.',
+      'The third check is the one that matters for tomorrow: when the fiber comes back, the preference 5 route becomes usable again and wins. If you had "fixed" it by making LTE preference 5 or deleting the fiber route, the café would have stayed on metered LTE forever.',
+      'Lesson for designs: a floating static only notices the local link dropping. Test failover by actually pulling the cable, and write the carrier\'s gateway into the config comment.',
+    ],
+    ninja: [{ tag: 'Proved the next hop was dead', say: 'You asked who answers before you changed a thing. Patience is a sharp blade.', test: (net, X) => X.ran(/^show arp/, 'rtr') || X.ran(/^ping 198\.51\.100\.6/, 'rtr') }],
+  },
+
+  {
+    id: 'IS2', kind: 'design', ticket: 'BUILD-2110', priority: 'P3', sla: 25, reward: 900, par: 2,
+    client: 'Ainokura Washi Paper Mill', title: 'Design the failover',
+    reporter: 'Mr. Nishida, Mill Owner',
+    topic: { area: 'route preference and failover design', jncis: 'Protocol Independent Routing', ccna: 'IP Connectivity' },
+    brief: 'A build. The mill\'s new router is cabled to a fiber line and an LTE modem, interfaces addressed, and nothing else. There is no default route yet, so the mill has no Internet. Design the routing so the fiber carries everything, and the LTE (billed per gigabyte) only carries traffic when the fiber is down.',
+    quotes: [
+      ['Spec', 'Fiber gateway 203.0.113.1. LTE gateway 198.51.100.1. Static routes only; no dynamic protocols at this site.'],
+      ['Spec', 'LTE must never carry traffic while the fiber is up. Failover and failback must be automatic.'],
+      ['Mr. Nishida', 'The LTE bill last winter was more than my paper. Never again.'],
+    ],
+    focus: 'rtr',
+    villain: 'Two links, one default route, and a meter running. What could go wrong? Everything. Heh.',
+    heat: {
+      devs: { rtr: 2, sw: -1, pc: 1, cad: 1, inet: -2, lte: -2 },
+      clues: [
+        { dev: 'rtr', re: /^set routing-options static route 0\.0\.0\.0\/0 next-hop 203\.0\.113\.1/, h: 3, say: ['Fiber\'s the primary. Now the standby.'] },
+        { dev: 'rtr', re: /^set routing-options static route 0\.0\.0\.0\/0 qualified-next-hop 198\.51\.100\.1 preference/, h: 3, say: ['Standby with its own preference. That\'s the trick.'] },
+        { dev: 'rtr', re: /^set routing-options static route 0\.0\.0\.0\/0 qualified-next-hop 198\.51\.100\.1$/, h: 1, say: ['No preference on it? Then it ties with the fiber at 5. Hmm.'] },
+        { dev: 'rtr', re: /^set routing-options static route 0\.0\.0\.0\/0 next-hop 198\.51\.100\.1/, h: -1, say: ['Two plain next hops is one route with two exits. That\'s not a backup, that\'s a coin toss on the meter.'] },
+        { dev: 'rtr', re: /^show route/, h: 1 },
+        { dev: 'rtr', re: /^show interfaces/, h: 1 },
+        { dev: ['inet', 'lte'], re: /./, h: -2 },
+        { dev: 'sw', re: /./, h: -1 },
+      ],
+    },
+    devices: [
+      { id: 'inet', type: 'cloud', name: 'Fiber ISP', hw: 'ISP edge', x: 290, y: 60, ports: ['ge-0/0/0'],
+        config: `
+          set system host-name fiber-isp
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.1/30
+          set interfaces lo0 unit 0 family inet address 8.8.8.8/32
+          set routing-options static route 10.0.0.0/8 next-hop 203.0.113.2` },
+      { id: 'lte', type: 'cloud', name: 'LTE carrier', hw: 'LTE modem', x: 710, y: 60, ports: ['ge-0/0/0'],
+        config: `
+          set system host-name lte-carrier
+          set interfaces ge-0/0/0 unit 0 family inet address 198.51.100.1/29
+          set interfaces lo0 unit 0 family inet address 8.8.8.8/32
+          set routing-options static route 10.0.0.0/8 next-hop 198.51.100.2` },
+      {
+        id: 'rtr', type: 'router', name: 'ank-rtr1', hw: 'srx300', x: 500, y: 180, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2'],
+        config: `
+          set system host-name ank-rtr1
+          set interfaces ge-0/0/0 description "fiber"
+          set interfaces ge-0/0/0 unit 0 family inet address 203.0.113.2/30
+          set interfaces ge-0/0/1 description "mill LAN"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.93.10.1/24
+          set interfaces ge-0/0/2 description "LTE modem (metered)"
+          set interfaces ge-0/0/2 unit 0 family inet address 198.51.100.2/29`,
+      },
+      { id: 'sw', type: 'switch', name: 'ank-sw1', hw: 'ex2300-c-12p', x: 500, y: 320, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2'],
+        config: `
+          set system host-name ank-sw1
+          set interfaces ge-0/0/0 description "to ank-rtr1"
+          set interfaces ge-0/0/1 description "office"
+          set interfaces ge-0/0/2 description "design workstation"` },
+      { id: 'pc', type: 'pc', name: 'Office-PC', x: 330, y: 470, nic: { dhcp: true, offset: 21 } },
+      { id: 'cad', type: 'pc', name: 'Design-WS', x: 670, y: 470, nic: { dhcp: true, offset: 22 } },
+    ],
+    links: [
+      ['inet:ge-0/0/0', 'rtr:ge-0/0/0'], ['lte:ge-0/0/0', 'rtr:ge-0/0/2'], ['rtr:ge-0/0/1', 'sw:ge-0/0/0'],
+      ['sw:ge-0/0/1', 'pc:eth0'], ['sw:ge-0/0/2', 'cad:eth0'],
+    ],
+    checks: [
+      { from: 'pc', to: '8.8.8.8', via: 'inet', label: 'Office-PC → Internet over fiber' },
+      { from: 'cad', to: '8.8.8.8', avoid: 'lte', label: 'Spec: nothing touches the metered LTE while fiber is up' },
+      { label: 'Spec: LTE route is a standby (higher preference than fiber)', test: (net, RC) => {
+        const rs = net.dev.rtr.model.routes.filter(r => r.prefix === '0.0.0.0/0');
+        const f = rs.find(r => r.nh === '203.0.113.1'), l = rs.find(r => r.nh === '198.51.100.1');
+        return !!f && !!l && l.pref > f.pref;
+      } },
+      { from: 'pc', to: '8.8.8.8', cut: ['rtr:ge-0/0/0'], via: 'lte', label: 'Failover test: fiber unplugged → Office-PC reaches Internet over LTE' },
+      { from: 'cad', to: '8.8.8.8', cut: ['rtr:ge-0/0/0'], label: 'Failover test: fiber unplugged → Design-WS reaches Internet' },
+    ],
+    rca: {
+      question: 'Design review: why does the LTE route need its own, higher preference?',
+      options: [
+        { t: 'Without a preference Junos ignores a qualified next hop entirely.', ok: false },
+        { t: 'Preference sets how much bandwidth each link is allowed to carry.', ok: false },
+        { t: 'Junos activates the lowest preference it can use. At preference 10 the LTE route sits in the table as a standby and only wins when the preference 5 fiber route becomes unusable, then steps back when the fiber returns.', ok: true },
+        { t: 'Two static routes for 0.0.0.0/0 can\'t coexist unless their preferences differ.', ok: false },
+      ],
+    },
+    hints: [
+      'Two routes to the same place, 0.0.0.0/0. One should always win while it can. Which knob decides between routes with the same prefix?',
+      'The fiber gets a normal next-hop (preference 5 by default). The LTE needs a qualified-next-hop, because that is the only way to give one next hop its own preference.',
+      'set routing-options static route 0.0.0.0/0 next-hop 203.0.113.1, and set routing-options static route 0.0.0.0/0 qualified-next-hop 198.51.100.1 preference 10. Commit, then run show route 0.0.0.0/0.',
+    ],
+    debrief: [
+      'Two lines: next-hop 203.0.113.1 at the default preference of 5, and qualified-next-hop 198.51.100.1 preference 10. Both sit in the routing table. Only the fiber one carries the star.',
+      'When the fiber port goes down, its next hop is no longer on a connected subnet, the route becomes unusable, and the preference 10 route goes active. When the fiber comes back, preference 5 wins again. No human, no script.',
+      'Two plain next-hop statements look similar but behave differently: one route, two equal next hops. Junos picks one (or load-shares if you tell it to), and the meter runs.',
+      'Any preference above 5 works. Many shops pick a big, obvious number like 200 so nobody mistakes the backup for a primary.',
+      'The honest limit: a floating static only reacts to the local link. If the fiber stays lit but the ISP breaks upstream, you need probes (RPM plus ip-monitoring) to fail over. That is a good JNCIP-level upgrade.',
+    ],
+    ninja: [{ tag: 'Verified both paths', say: 'You checked the table after you built it. A design you have not looked at is only a wish.', test: (net, X) => X.after(X.idx(/^commit/, true), c => /^show route/.test(c.key)) }],
+  },
+
+  {
+    id: 'IS3', ticket: 'TKT-2131', priority: 'P2', sla: 25, reward: 900, par: 1,
+    client: 'Gero Onsen Ryokan Group', title: 'The annex vanished after the storage upgrade',
+    reporter: 'Front Office Manager',
+    topic: { area: 'OSPF adjacencies and MTU', jncis: 'OSPF', ccna: 'IP Connectivity' },
+    brief: 'The annex front desk can\'t reach the reservation server at the main building. Started right after last night\'s maintenance window, when a storage vendor "enabled jumbo frames on the backbone" for replication. Both routers are up and the dark fiber between them shows link.',
+    quotes: [
+      ['Front Office Manager', 'Guests are checking in at the annex and we\'re writing room numbers on sticky notes.'],
+      ['Storage vendor (email)', 'Jumbo enabled on HQ backbone port, replication speed up 40%. You\'re welcome.'],
+      ['Annex desk clerk', 'I can still print. I just can\'t see any reservations.'],
+    ],
+    focus: 'annex',
+    villain: 'Bigger is better, said every vendor ever. Mwa-ha-ha.',
+    heat: {
+      devs: { hq: 2, ax: 2, res: -1, annex: 1, office: -2 },
+      clues: [
+        { dev: ['hq', 'ax'], re: /^show ospf neighbor/, h: 3, say: ['ExStart. Stuck at the handshake. What would make two routers disagree on a database exchange?', 'ExStart again. Think SIZE.'] },
+        { dev: ['hq', 'ax'], re: /^show interfaces ge-0\/0\/0/, h: 3, say: ['Look at the MTU line. Now look at the other side.'] },
+        { dev: ['hq', 'ax'], re: /^show ospf interface/, h: 2 },
+        { dev: ['hq', 'ax'], re: /^show route/, h: 2, say: ['Where are the annex routes? OSPF isn\'t handing them over.'] },
+        { dev: ['hq', 'ax'], re: /^show log/, h: 2, say: ['Read the rpd line. SeqNumMismatch is a hint.'] },
+        { dev: ['hq', 'ax'], re: /^ping 10\.90\.255/, h: 1, say: ['The link pings fine. It\'s not the cable.'] },
+        { dev: ['hq', 'ax'], re: /(set|delete) interfaces ge-0\/0\/0 mtu/, h: 3, say: ['Make them match. Commit, then check the neighbor.'] },
+        { dev: ['hq', 'ax'], re: /^show configuration/, h: 2 },
+        { dev: 'annex', re: /^(ping|tracert)/, h: 1, say: ['Gets to the annex router and stops. Routing problem.'] },
+        { dev: ['res', 'office'], re: /./, h: -2, say: ['HQ\'s happy. The annex is the one that\'s lost.'] },
+      ],
+    },
+    devices: [
+      {
+        id: 'hq', type: 'router', name: 'gro-hq-rtr', hw: 'srx320', x: 330, y: 220, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2'],
+        config: `
+          set system host-name gro-hq-rtr
+          set interfaces ge-0/0/0 description "dark fiber to annex"
+          set interfaces ge-0/0/0 mtu 9216
+          set interfaces ge-0/0/0 unit 0 family inet address 10.90.255.1/30
+          set interfaces ge-0/0/1 description "server LAN"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.90.10.1/24
+          set interfaces ge-0/0/2 description "HQ office LAN"
+          set interfaces ge-0/0/2 unit 0 family inet address 10.90.11.1/24
+          set interfaces lo0 unit 0 family inet address 10.90.0.1/32
+          set protocols ospf area 0.0.0.0 interface ge-0/0/0.0
+          set protocols ospf area 0.0.0.0 interface ge-0/0/1.0 passive
+          set protocols ospf area 0.0.0.0 interface ge-0/0/2.0 passive
+          set protocols ospf area 0.0.0.0 interface lo0.0 passive`,
+        commits: [
+          { user: 'storage-vendor', when: '2026-11-03 23:41:10', comment: 'jumbo for replication' },
+          { user: 'noc', when: '2026-09-12 10:02:44', comment: '', undo: { remove: ['set interfaces ge-0/0/0 mtu 9216'] } },
+        ],
+        logs: `
+          Nov  3 23:40:51  gro-hq-rtr mgd[4410]: UI_CFG_AUDIT_SET: User 'storage-vendor' set: [interfaces ge-0/0/0 mtu] 9216
+          Nov  3 23:41:10  gro-hq-rtr mgd[4410]: UI_COMMIT: User 'storage-vendor' requested 'commit' operation (comment: jumbo for replication)
+          Nov  3 23:41:12  gro-hq-rtr mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 513, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/0
+          Nov  3 23:41:14  gro-hq-rtr mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 513, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/0
+          Nov  3 23:41:14  gro-hq-rtr rpd[1612]: RPD_OSPF_NBRDOWN: OSPF neighbor 10.90.255.2 (realm ospf-v2 ge-0/0/0.0 area 0.0.0.0) state changed from Full to Down due to KillNbr (event reason: interface went down)
+          Nov  3 23:41:23  gro-hq-rtr rpd[1612]: RPD_OSPF_NBRDOWN: OSPF neighbor 10.90.255.2 (realm ospf-v2 ge-0/0/0.0 area 0.0.0.0) state changed from Exchange to ExStart due to SeqNumMismatch (event reason: DBD exchange of master/slave failed)`,
+      },
+      {
+        id: 'ax', type: 'router', name: 'gro-annex-rtr', hw: 'srx300', x: 690, y: 220, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name gro-annex-rtr
+          set interfaces ge-0/0/0 description "dark fiber to HQ"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.90.255.2/30
+          set interfaces ge-0/0/1 description "annex LAN"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.90.20.1/24
+          set interfaces lo0 unit 0 family inet address 10.90.0.2/32
+          set protocols ospf area 0.0.0.0 interface ge-0/0/0.0
+          set protocols ospf area 0.0.0.0 interface ge-0/0/1.0 passive
+          set protocols ospf area 0.0.0.0 interface lo0.0 passive`,
+        logs: `
+          Nov  3 23:41:12  gro-annex-rtr mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 513, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/0
+          Nov  3 23:41:14  gro-annex-rtr mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 513, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/0
+          Nov  3 23:41:23  gro-annex-rtr rpd[1612]: RPD_OSPF_NBRDOWN: OSPF neighbor 10.90.255.1 (realm ospf-v2 ge-0/0/0.0 area 0.0.0.0) state changed from Exchange to ExStart due to SeqNumMismatch (event reason: DBD exchange of master/slave failed)`,
+      },
+      { id: 'res', type: 'server', name: 'reserve01', x: 190, y: 450, nic: { ip: '10.90.10.10/24', gw: '10.90.10.1' } },
+      { id: 'office', type: 'pc', name: 'HQ-Office-PC', x: 430, y: 450, nic: { dhcp: true, offset: 21 } },
+      { id: 'annex', type: 'pc', name: 'Annex-Desk-PC', x: 690, y: 450, nic: { dhcp: true, offset: 31 } },
+    ],
+    links: [['hq:ge-0/0/0', 'ax:ge-0/0/0'], ['hq:ge-0/0/1', 'res:eth0'], ['hq:ge-0/0/2', 'office:eth0'], ['ax:ge-0/0/1', 'annex:eth0']],
+    checks: [
+      { from: 'annex', to: '10.90.10.10', label: 'Annex-Desk-PC → reserve01 (reservations)' },
+      { from: 'res', to: '10.90.20.31', label: 'reserve01 → Annex-Desk-PC (booking pushes)' },
+      { from: 'office', to: '10.90.10.10', label: 'HQ-Office-PC → reserve01 (still works)' },
+    ],
+    rca: {
+      question: 'What was the root cause?',
+      options: [
+        { t: 'The vendor\'s maintenance bounced the fiber link, and OSPF never retried.', ok: false },
+        { t: 'The vendor set HQ\'s ge-0/0/0 to MTU 9216 but left the annex side at the default. OSPF compares MTU during its database exchange, so the neighbors stuck in ExStart and never shared routes.', ok: true },
+        { t: 'The annex LAN is passive, so OSPF can\'t advertise it.', ok: false },
+        { t: 'Jumbo frames are not supported on SRX branch routers.', ok: false },
+      ],
+    },
+    hints: [
+      'Both routers are up and can ping each other\'s link address. So why no routes? show ospf neighbor on either router.',
+      'Stuck in ExStart (or Exchange) almost always means an MTU mismatch. Compare show interfaces ge-0/0/0 on both routers. Look at the MTU line.',
+      'Make the MTUs match on the link: either set interfaces ge-0/0/0 mtu 9216 on gro-annex-rtr (keeps the vendor\'s jumbo), or delete interfaces ge-0/0/0 mtu on gro-hq-rtr. Commit, then check show ospf neighbor.',
+    ],
+    debrief: [
+      'OSPF neighbors exchange database descriptions that include their interface MTU. If they differ, the side with the smaller MTU rejects the other\'s packets, and both sit in ExStart/Exchange forever. Hellos still work, so it looks "almost up."',
+      'The physical link and pings across it were fine the whole time. Only OSPF cared, and because routes come from OSPF, the annex LAN disappeared from HQ\'s routing table.',
+      'Either fix works. Raising the annex side to 9216 keeps the vendor\'s replication gains; removing it on HQ restores the old state. In real life ask what the jumbo was for before you undo it.',
+      'You met MTU in JNCIA Chapter 2 as a data-plane problem (oversized frames). Here it is a control-plane problem. Same knob, different symptom. Some shops set "ip-mtu-ignore"-style workarounds; Junos has no such default, and matching MTU is the right fix.',
+    ],
+    ninja: [{ tag: 'Verified the adjacency', say: 'After the fix you asked the neighbor, not the user. Trust, but verify the handshake.', test: (net, X) => X.after(X.idx(/^commit/, true), c => /^show ospf neighbor/.test(c.key)) }],
+  },
+
+  {
+    id: 'IS4', ticket: 'TKT-2140', priority: 'P2', sla: 25, reward: 900, par: 2,
+    client: 'Hida Copper Kettle Roasters', title: 'The new warehouse router won\'t talk',
+    reporter: 'Marcus Webb, Owner',
+    topic: { area: 'OSPF areas and adjacency rules', jncis: 'OSPF', ccna: 'IP Connectivity' },
+    brief: 'Business is good: Hida Copper Kettle opened a second warehouse. A contractor installed a router there (ckr-whse-rtr2) and "set up OSPF so it\'s automatic." The link to HQ is up, but HQ can\'t reach the packing station or the label printer in the new building, and the new building can\'t reach HQ.',
+    quotes: [
+      ['Marcus', 'Remember the label printer saga? Please tell me this isn\'t that again.'],
+      ['Contractor (handoff doc)', 'OSPF configured. New site in its own area for scalability. Best practice.'],
+      ['Packing lead', 'We\'re printing labels by hand. Again.'],
+    ],
+    focus: 'w2',
+    villain: '"Best practice." Said with total confidence and zero verification. I love it.',
+    heat: {
+      devs: { hq: 2, w2: 2, pc: -1, pack: 1, lbl: 1 },
+      clues: [
+        { dev: ['hq', 'w2'], re: /^show ospf neighbor/, h: 2, say: ['Nobody. Hellos are going out, but someone\'s ignoring them.'] },
+        { dev: ['hq', 'w2'], re: /^show ospf interface/, h: 3, say: ['Look at the Area column. Both ends of ONE link.'] },
+        { dev: ['hq', 'w2'], re: /^show configuration protocols ospf/, h: 3, say: ['Compare the areas on each side of that /30.'] },
+        { dev: ['hq', 'w2'], re: /^show configuration/, h: 2 },
+        { dev: ['hq', 'w2'], re: /^show route/, h: 1 },
+        { dev: 'w2', re: /^(set|delete) protocols ospf area .* interface ge-0\/0\/0/, h: 3, say: ['The uplink has to match HQ. The LANs can stay where they are.'] },
+        { dev: ['hq', 'w2'], re: /^ping 10\.20\.250/, h: 1, say: ['The link\'s fine. Layer 3 neighbors, sure. OSPF neighbors? Not so much.'] },
+        { dev: ['hq', 'w2'], re: /^show interfaces/, h: 1 },
+        { dev: 'hq', re: /^(set|delete) protocols ospf/, h: -1, say: ['Careful! HQ\'s backbone area is fine. Don\'t move HQ to match the contractor.'] },
+        { dev: 'pc', re: /./, h: -1 },
+      ],
+    },
+    devices: [
+      {
+        id: 'hq', type: 'router', name: 'ckr-rtr1', hw: 'srx320', x: 330, y: 220, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name ckr-rtr1
+          set interfaces ge-0/0/0 description "to warehouse 2"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.20.250.1/30
+          set interfaces ge-0/0/1 description "HQ office LAN"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.20.10.1/24
+          set interfaces lo0 unit 0 family inet address 10.20.0.1/32
+          set protocols ospf area 0.0.0.0 interface ge-0/0/0.0
+          set protocols ospf area 0.0.0.0 interface ge-0/0/1.0 passive
+          set protocols ospf area 0.0.0.0 interface lo0.0 passive`,
+      },
+      {
+        id: 'w2', type: 'router', name: 'ckr-whse-rtr2', hw: 'srx300', x: 690, y: 220, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2'],
+        config: `
+          set system host-name ckr-whse-rtr2
+          set interfaces ge-0/0/0 description "to HQ"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.20.250.2/30
+          set interfaces ge-0/0/1 description "packing"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.20.60.1/24
+          set interfaces ge-0/0/2 description "label printer"
+          set interfaces ge-0/0/2 unit 0 family inet address 10.20.61.1/24
+          set interfaces lo0 unit 0 family inet address 10.20.0.2/32
+          set protocols ospf area 0.0.0.1 interface ge-0/0/0.0
+          set protocols ospf area 0.0.0.1 interface ge-0/0/1.0 passive
+          set protocols ospf area 0.0.0.1 interface ge-0/0/2.0 passive
+          set protocols ospf area 0.0.0.1 interface lo0.0 passive`,
+        commits: [{ user: 'contractor', when: '2026-11-02 14:12:09', comment: 'initial build - ospf' }],
+      },
+      { id: 'pc', type: 'pc', name: 'HQ-Office-PC', x: 330, y: 450, nic: { dhcp: true, offset: 21 } },
+      { id: 'pack', type: 'pc', name: 'Packing-PC', x: 600, y: 450, nic: { dhcp: true, offset: 21 } },
+      { id: 'lbl', type: 'printer', name: 'zebra-lp2', x: 820, y: 450, nic: { ip: '10.20.61.50/24', gw: '10.20.61.1' } },
+    ],
+    links: [['hq:ge-0/0/0', 'w2:ge-0/0/0'], ['hq:ge-0/0/1', 'pc:eth0'], ['w2:ge-0/0/1', 'pack:eth0'], ['w2:ge-0/0/2', 'lbl:eth0']],
+    checks: [
+      { from: 'pc', to: '10.20.60.21', label: 'HQ-Office-PC → Packing-PC (orders)' },
+      { from: 'pc', to: '10.20.61.50', label: 'HQ-Office-PC → zebra-lp2 (shipping labels)' },
+      { from: 'pack', to: '10.20.10.21', label: 'Packing-PC → HQ-Office-PC' },
+      { label: 'HQ\'s backbone link stays in area 0.0.0.0', test: (net, RC) => { const o = net.dev.hq.model.ospf; return !!o && !!o.ifaces['ge-0/0/0.0'] && o.ifaces['ge-0/0/0.0'].area === '0.0.0.0'; } },
+    ],
+    rca: {
+      question: 'What was the root cause?',
+      options: [
+        { t: 'The new router\'s LANs are passive, so OSPF never advertises them.', ok: false },
+        { t: 'OSPF needs a loopback in area 0 on every router.', ok: false },
+        { t: 'The contractor put the new router\'s uplink in area 0.0.0.1 while HQ runs the same link in area 0.0.0.0. Neighbors on a link must agree on its area, so the hellos were ignored and no adjacency formed.', ok: true },
+        { t: 'The link needs an MTU of 9216 for OSPF to work.', ok: false },
+      ],
+    },
+    hints: [
+      'Run show ospf neighbor on both routers. Empty means hellos are arriving and being ignored. Something in the hello disagrees.',
+      'Compare show ospf interface on both sides. Look at the Area column for ge-0/0/0.0 on each end of the link.',
+      'On ckr-whse-rtr2: delete protocols ospf area 0.0.0.1 interface ge-0/0/0.0, then set protocols ospf area 0.0.0.0 interface ge-0/0/0.0. The warehouse LANs can stay in area 1; the new router becomes an area border router. Commit.',
+    ],
+    debrief: [
+      'Every OSPF hello carries an area ID. Two routers on the same link only become neighbors if their area IDs match (plus subnet, timers, authentication and a few more). One side said 0.0.0.0, the other 0.0.0.1, so each quietly dropped the other\'s hellos.',
+      'The contractor wasn\'t wrong that a new site can live in its own area. The mistake was putting the link to HQ in that area. The link has to be in an area both sides share. With the uplink in area 0, ckr-whse-rtr2 becomes an ABR: backbone on one side, area 1 on the other.',
+      'Junos doesn\'t log area mismatches by default. show ospf interface on both ends, side by side, is the fastest way to spot them. (show ospf statistics would show the dropped hellos as "bad area.")',
+      'Moving HQ\'s side to area 1 would also make a neighbor, but it would push HQ\'s backbone into a non-backbone area. Fix the newcomer, not the backbone.',
+    ],
+    ninja: [{ tag: 'Compared both ends', say: 'You looked at both ends of the link. Every adjacency has two sides, and so does every story.', test: (net, X) => X.ran(/^show ospf interface/, 'hq') && X.ran(/^show ospf interface/, 'w2') }],
+  },
+
+  {
+    id: 'IS5', ticket: 'TKT-2152', priority: 'P2', sla: 20, reward: 850, par: 1,
+    client: 'Nozawa Onsen Lodge', title: 'New desk phones can\'t reach the PBX',
+    reporter: 'Lodge Manager',
+    topic: { area: 'OSPF route advertisement and passive interfaces', jncis: 'OSPF', ccna: 'IP Connectivity' },
+    brief: 'The lodge got new IP desk phones on their own VOICE VLAN. The phones power up, show the right time, and then say "Registration failed." The phone system (pbx01) lives at the main office down the valley, connected to the lodge switch over the town\'s fiber with OSPF. Office PCs at the lodge reach the main office fine.',
+    quotes: [
+      ['Lodge Manager', 'The ski season opens Saturday. Guests will want to call the front desk.'],
+      ['Installer', 'VLAN, gateway, ports: all done on nzo-core. Phones get 10.72.30.x. Not my fault after that.'],
+      ['Main office IT', 'We see the lodge office subnet in our table. Nothing else new.'],
+    ],
+    focus: 'ph1',
+    villain: 'The phones can talk. Nobody can talk BACK. My favorite kind of outage.',
+    heat: {
+      devs: { hq: 2, core: 2, ph1: 1, ph2: 1, pc: -1, pbx: -1 },
+      clues: [
+        { dev: 'hq', re: /^show route (10\.72\.30|protocol ospf)/, h: 3, say: ['No 10.72.30.0/24 at HQ. Who\'s supposed to tell it?'] },
+        { dev: 'hq', re: /^show route/, h: 2 },
+        { dev: 'core', re: /^show ospf interface/, h: 3, say: ['Count the irbs. Which one\'s missing?'] },
+        { dev: 'core', re: /^show configuration protocols ospf/, h: 3 },
+        { dev: 'core', re: /^show ospf neighbor/, h: 1, say: ['Neighbor\'s Full. The adjacency\'s fine. It\'s about WHAT gets advertised.'] },
+        { dev: 'core', re: /^set protocols ospf area .* interface irb\.30/, h: 3, say: ['That\'s it. Passive or not? Are there routers on the phone VLAN?'] },
+        { dev: 'core', re: /^show (vlans|interfaces)/, h: 1, say: ['VLAN and gateway look good. The installer did that part.'] },
+        { dev: 'core', re: /^show configuration/, h: 2 },
+        { dev: ['ph1', 'ph2'], re: /^ping 10\.72\.30\.1/, h: 1, say: ['The phones reach their gateway. The problem\'s further out.'] },
+        { dev: ['ph1', 'ph2'], re: /^ping/, h: 1 },
+        { dev: ['pc', 'pbx'], re: /./, h: -1 },
+      ],
+    },
+    devices: [
+      {
+        id: 'hq', type: 'router', name: 'nzo-hq-rtr', hw: 'srx320', x: 280, y: 200, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name nzo-hq-rtr
+          set interfaces ge-0/0/0 description "town fiber to lodge"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.72.255.1/30
+          set interfaces ge-0/0/1 description "server LAN"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.72.50.1/24
+          set interfaces lo0 unit 0 family inet address 10.72.0.1/32
+          set protocols ospf area 0.0.0.0 interface ge-0/0/0.0
+          set protocols ospf area 0.0.0.0 interface ge-0/0/1.0 passive
+          set protocols ospf area 0.0.0.0 interface lo0.0 passive`,
+      },
+      {
+        id: 'core', type: 'switch', name: 'nzo-core', hw: 'ex2300-24p', x: 640, y: 300, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2', 'ge-0/0/3'],
+        config: `
+          set system host-name nzo-core
+          set interfaces ge-0/0/0 description "town fiber to HQ"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.72.255.2/30
+          set interfaces ge-0/0/1 description "lodge office pc"
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/1 unit 0 family ethernet-switching vlan members OFFICE
+          set interfaces ge-0/0/2 description "phone - front desk"
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members VOICE
+          set interfaces ge-0/0/3 description "phone - ski room"
+          set interfaces ge-0/0/3 unit 0 family ethernet-switching interface-mode access
+          set interfaces ge-0/0/3 unit 0 family ethernet-switching vlan members VOICE
+          set interfaces irb unit 10 family inet address 10.72.10.1/24
+          set interfaces irb unit 30 family inet address 10.72.30.1/24
+          set interfaces lo0 unit 0 family inet address 10.72.0.2/32
+          set vlans OFFICE vlan-id 10
+          set vlans OFFICE l3-interface irb.10
+          set vlans VOICE vlan-id 30
+          set vlans VOICE l3-interface irb.30
+          set protocols ospf area 0.0.0.0 interface ge-0/0/0.0
+          set protocols ospf area 0.0.0.0 interface irb.10 passive
+          set protocols ospf area 0.0.0.0 interface lo0.0 passive`,
+        commits: [
+          { user: 'installer', when: '2026-11-03 10:15:31', comment: 'voice vlan for new phones' },
+          { user: 'noc', when: '2026-08-20 09:00:12', comment: '', undo: { remove: ['set interfaces ge-0/0/2 description "phone - front desk"', 'set interfaces ge-0/0/2 unit 0 family ethernet-switching interface-mode access', 'set interfaces ge-0/0/2 unit 0 family ethernet-switching vlan members VOICE', 'set interfaces ge-0/0/3 description "phone - ski room"', 'set interfaces ge-0/0/3 unit 0 family ethernet-switching interface-mode access', 'set interfaces ge-0/0/3 unit 0 family ethernet-switching vlan members VOICE', 'set interfaces irb unit 30 family inet address 10.72.30.1/24', 'set vlans VOICE vlan-id 30', 'set vlans VOICE l3-interface irb.30'] } },
+        ],
+      },
+      { id: 'pbx', type: 'server', name: 'pbx01', x: 200, y: 450, nic: { ip: '10.72.50.10/24', gw: '10.72.50.1' } },
+      { id: 'pc', type: 'pc', name: 'Lodge-Office-PC', x: 440, y: 450, nic: { dhcp: true, offset: 21 } },
+      { id: 'ph1', type: 'phone', name: 'FrontDesk-Phone', x: 640, y: 450, nic: { ip: '10.72.30.21/24', gw: '10.72.30.1' } },
+      { id: 'ph2', type: 'phone', name: 'SkiRoom-Phone', x: 840, y: 450, nic: { ip: '10.72.30.22/24', gw: '10.72.30.1' } },
+    ],
+    links: [['hq:ge-0/0/0', 'core:ge-0/0/0'], ['hq:ge-0/0/1', 'pbx:eth0'], ['core:ge-0/0/1', 'pc:eth0'], ['core:ge-0/0/2', 'ph1:eth0'], ['core:ge-0/0/3', 'ph2:eth0']],
+    checks: [
+      { from: 'ph1', to: '10.72.50.10', label: 'FrontDesk-Phone → pbx01 (registration)' },
+      { from: 'ph2', to: '10.72.50.10', label: 'SkiRoom-Phone → pbx01 (registration)' },
+      { from: 'pbx', to: '10.72.30.21', label: 'pbx01 → FrontDesk-Phone (incoming calls)' },
+      { from: 'pc', to: '10.72.50.10', label: 'Lodge-Office-PC → pbx01 (still works)' },
+    ],
+    rca: {
+      question: 'What was the root cause?',
+      options: [
+        { t: 'The VOICE VLAN on nzo-core was never added to OSPF, so HQ never learned 10.72.30.0/24 and had no way to send replies back to the phones.', ok: true },
+        { t: 'The phones are in the wrong VLAN.', ok: false },
+        { t: 'The OSPF adjacency between HQ and the lodge is down.', ok: false },
+        { t: 'pbx01 has no default gateway.', ok: false },
+      ],
+    },
+    hints: [
+      'The phones reach their own gateway (10.72.30.1). Can HQ find its way back? On nzo-hq-rtr: show route 10.72.30.21.',
+      'HQ learns 10.72.10.0/24 from OSPF but not 10.72.30.0/24. On nzo-core: show ospf interface. Which irb is missing?',
+      'On nzo-core: set protocols ospf area 0.0.0.0 interface irb.30 passive. Passive advertises the subnet without sending hellos at the phones. Commit.',
+    ],
+    debrief: [
+      'The installer built the VLAN, the irb gateway and the ports correctly. The phones could send packets out. But OSPF only advertises interfaces you list under protocols ospf, and irb.30 wasn\'t there.',
+      'HQ had no route to 10.72.30.0/24. With no default route at HQ either, replies from pbx01 had nowhere to go. One-way traffic is the classic sign of a missing return route.',
+      'Passive is the right choice for user and phone VLANs: the subnet is advertised, but no hellos are sent toward devices that will never be OSPF routers. That avoids a rogue box forming an adjacency from a phone jack.',
+      'Make it a habit: new VLAN with an irb on an OSPF switch = one more line under protocols ospf. Add it to your VLAN build checklist from BUILD-301.',
+    ],
+    ninja: [{ tag: 'Passive, like a pro', say: 'Passive on a user VLAN. Advertise the land, but do not open the gate.', test: (net, X) => { const o = net.dev.core.model.ospf; return !!o && !!o.ifaces['irb.30'] && o.ifaces['irb.30'].passive; } }],
+  },
+
+  {
+    id: 'IS6', ticket: 'TKT-2167', priority: 'P1', sla: 20, reward: 1000, par: 1,
+    client: 'Obuse Chestnut Confectioners', title: 'OSPF says one thing, traffic does another',
+    reporter: 'Shop Manager',
+    topic: { area: 'route preference: static vs OSPF', jncis: 'OSPF', ccna: 'IP Connectivity' },
+    brief: 'The shop\'s old MPLS circuit was retired last month and replaced with direct fiber running OSPF. The kitchen tablet at the shop syncs orders with HQ fine. The registers at the shop can\'t reach the HQ inventory PC, so every chestnut sale is going on paper. Both live behind the same shop router.',
+    quotes: [
+      ['Shop Manager', 'It\'s chestnut season. This is our Christmas.'],
+      ['HQ IT (handoff note)', 'MPLS router at 10.94.255.3 decommissioned Oct 6. All shop subnets now come from OSPF.'],
+      ['Baker', 'The tablet works. Why wouldn\'t the register?'],
+    ],
+    focus: 'hq',
+    villain: 'OSPF knows the right way. Too bad it isn\'t in charge. Heh heh heh.',
+    heat: {
+      devs: { hq: 2, shop: 1, reg: 1, tab: -1, inv: 1 },
+      clues: [
+        { dev: 'hq', re: /^show route 10\.94\.40/, h: 3, say: ['Two routes for one prefix. Which one has the star, and why?', 'Static/5 versus OSPF/10. Lower wins. Is the winner any good?'] },
+        { dev: 'hq', re: /^show route 10\.94\.41/, h: 1, say: ['The kitchen\'s route is clean. Compare it to the register\'s.'] },
+        { dev: 'hq', re: /^show route protocol static/, h: 3 },
+        { dev: 'hq', re: /^show route/, h: 2 },
+        { dev: 'hq', re: /^show arp/, h: 3, say: ['Anyone home at 10.94.255.3? Didn\'t think so.'] },
+        { dev: 'hq', re: /^show ospf neighbor/, h: 1, say: ['OSPF\'s Full and happy. OSPF isn\'t the problem.'] },
+        { dev: 'hq', re: /^(delete routing-options static route 10\.94\.40\.0\/24|set routing-options static route 10\.94\.40\.0\/24 preference)/, h: 3, say: ['Clean cut. Commit.'] },
+        { dev: 'hq', re: /^show configuration/, h: 2 },
+        { dev: 'shop', re: /^show (route|ospf)/, h: 1, say: ['The shop router\'s routes look right. Check HQ\'s side.'] },
+        { dev: 'tab', re: /./, h: -1, say: ['The tablet\'s happy. Go bother the register.'] },
+      ],
+    },
+    devices: [
+      {
+        id: 'hq', type: 'router', name: 'obs-hq-rtr', hw: 'srx320', x: 300, y: 220, ports: ['ge-0/0/0', 'ge-0/0/1'],
+        config: `
+          set system host-name obs-hq-rtr
+          set interfaces ge-0/0/0 description "fiber to shop (old MPLS handoff /29)"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.94.255.1/29
+          set interfaces ge-0/0/1 description "HQ office LAN"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.94.10.1/24
+          set interfaces lo0 unit 0 family inet address 10.94.0.1/32
+          set routing-options static route 10.94.40.0/24 next-hop 10.94.255.3
+          set protocols ospf area 0.0.0.0 interface ge-0/0/0.0
+          set protocols ospf area 0.0.0.0 interface ge-0/0/1.0 passive
+          set protocols ospf area 0.0.0.0 interface lo0.0 passive`,
+        logs: `
+          Oct  6 21:02:18  obs-hq-rtr mgd[4410]: UI_COMMIT: User 'hq-it' requested 'commit' operation (comment: ospf to shop over new fiber)
+          Oct  6 21:02:31  obs-hq-rtr rpd[1612]: RPD_OSPF_NBRUP: OSPF neighbor 10.94.255.2 (realm ospf-v2 ge-0/0/0.0 area 0.0.0.0) state changed from Loading to Full due to LoadDone (event reason: OSPF loadDone)
+          Oct  6 21:15:40  obs-hq-rtr mib2d[1702]: SNMP_TRAP_LINK_DOWN: ifIndex 513, ifAdminStatus up(1), ifOperStatus down(2), ifName ge-0/0/0
+          Oct  6 21:16:02  obs-hq-rtr mib2d[1702]: SNMP_TRAP_LINK_UP: ifIndex 513, ifAdminStatus up(1), ifOperStatus up(1), ifName ge-0/0/0`,
+      },
+      {
+        id: 'shop', type: 'router', name: 'obs-shop-rtr', hw: 'srx300', x: 700, y: 220, ports: ['ge-0/0/0', 'ge-0/0/1', 'ge-0/0/2'],
+        config: `
+          set system host-name obs-shop-rtr
+          set interfaces ge-0/0/0 description "fiber to HQ"
+          set interfaces ge-0/0/0 unit 0 family inet address 10.94.255.2/29
+          set interfaces ge-0/0/1 description "registers"
+          set interfaces ge-0/0/1 unit 0 family inet address 10.94.40.1/24
+          set interfaces ge-0/0/2 description "kitchen"
+          set interfaces ge-0/0/2 unit 0 family inet address 10.94.41.1/24
+          set interfaces lo0 unit 0 family inet address 10.94.0.2/32
+          set protocols ospf area 0.0.0.0 interface ge-0/0/0.0
+          set protocols ospf area 0.0.0.0 interface ge-0/0/1.0 passive
+          set protocols ospf area 0.0.0.0 interface ge-0/0/2.0 passive
+          set protocols ospf area 0.0.0.0 interface lo0.0 passive`,
+      },
+      { id: 'inv', type: 'pc', name: 'HQ-Inventory-PC', x: 300, y: 450, nic: { dhcp: true, offset: 21 } },
+      { id: 'reg', type: 'pc', name: 'Register-1', x: 600, y: 450, nic: { dhcp: true, offset: 21 } },
+      { id: 'tab', type: 'laptop', name: 'Kitchen-Tablet', x: 820, y: 450, nic: { dhcp: true, offset: 31 } },
+    ],
+    links: [['hq:ge-0/0/0', 'shop:ge-0/0/0'], ['hq:ge-0/0/1', 'inv:eth0'], ['shop:ge-0/0/1', 'reg:eth0'], ['shop:ge-0/0/2', 'tab:eth0']],
+    checks: [
+      { from: 'reg', to: '10.94.10.21', label: 'Register-1 → HQ-Inventory-PC (sales sync)' },
+      { from: 'inv', to: '10.94.40.21', label: 'HQ-Inventory-PC → Register-1 (price updates)' },
+      { from: 'tab', to: '10.94.10.21', label: 'Kitchen-Tablet → HQ-Inventory-PC (still works)' },
+    ],
+    rca: {
+      question: 'What was the root cause?',
+      options: [
+        { t: 'The shop router doesn\'t advertise the register subnet into OSPF.', ok: false },
+        { t: 'OSPF can\'t run on a /29.', ok: false },
+        { t: 'A leftover static route for 10.94.40.0/24 still pointed at the retired MPLS router (10.94.255.3). Static (preference 5) beats OSPF (preference 10), so the dead static route won over the correct OSPF route.', ok: true },
+        { t: 'The registers have the wrong default gateway.', ok: false },
+      ],
+    },
+    hints: [
+      'Kitchen (10.94.41.x) works, registers (10.94.40.x) don\'t, same shop router. On obs-hq-rtr compare show route 10.94.40.21 with show route 10.94.41.31.',
+      'Two routes for 10.94.40.0/24: [Static/5] and [OSPF/10]. Same prefix, so preference decides, and 5 beats 10. Is the static next hop still alive? show arp no-resolve.',
+      'Remove the leftover: delete routing-options static route 10.94.40.0/24. (Or demote it with a preference above 10.) Commit.',
+    ],
+    debrief: [
+      'When the MPLS circuit was retired, everyone removed the router but not the static route that pointed at it. Its next hop, 10.94.255.3, was still inside the /29 on ge-0/0/0, so Junos considered the route valid.',
+      'Both routes were for exactly 10.94.40.0/24, so longest match was a tie and preference decided. Static is 5, OSPF internal is 10. The dead static route won, and the correct OSPF route sat underneath it, inactive.',
+      'The kitchen subnet had no leftover static, so OSPF\'s route was the only one, which made it look like a register problem.',
+      'This is the same trap as JNCIA\'s feed scale, one layer up: there, longest match picked the stale route; here, preference did. Either way, the fix is to clean up after decommissioning. show route protocol static is a great audit after any migration to a dynamic protocol.',
+    ],
+    ninja: [{ tag: 'Read the preference', say: 'You read the number after the slash. Most never do.', test: (net, X) => X.ran(/^show route 10\.94\.40/, 'hq') }],
+  },
+
 ];
+// What each ticket teaches, for the intro line. New tickets carry a topic block of their own.
+const TOPIC_DEFAULTS = {
+  T1: { area: 'VLANs and DHCP', jncia: 'Networking Fundamentals', ccna: 'Network Access' },
+  T2: { area: 'VLAN trunks', jncia: 'Networking Fundamentals', ccna: 'Network Access' },
+  T3: { area: 'routing and the return path', jncia: 'Routing Fundamentals', ccna: 'IP Connectivity' },
+  D1: { area: 'CLI modes and the candidate config', jncia: 'User Interfaces' },
+  D2: { area: 'rollback and commit history', jncia: 'Configuration Basics' },
+  D3: { area: 'commit confirmed', jncia: 'Configuration Basics' },
+  D4: { area: 'the rescue configuration', jncia: 'Configuration Basics' },
+  C1T1: { area: 'commit history and interface state', jncia: 'Configuration Basics' },
+  D5: { area: 'moving around the config hierarchy', jncia: 'User Interfaces' },
+  D6: { area: 'CLI pipes and filters', jncia: 'User Interfaces' },
+  D7: { area: 'commit check and commit comments', jncia: 'Configuration Basics' },
+  D8: { area: 'discarding a draft config', jncia: 'Configuration Basics' },
+  D21: { area: 'chassis health and alarms', jncia: 'Operational Monitoring and Maintenance' },
+  D22: { area: 'interface status at a glance', jncia: 'Operational Monitoring and Maintenance', ccna: 'Network Fundamentals' },
+  D23: { area: 'interface counters and errors', jncia: 'Operational Monitoring and Maintenance', ccna: 'Network Fundamentals' },
+  D24: { area: 'syslog filtering', jncia: 'Operational Monitoring and Maintenance', ccna: 'IP Services' },
+  C2T1: { area: 'MTU and jumbo frames', jncia: 'Operational Monitoring and Maintenance', ccna: 'Network Fundamentals' },
+};
+for (const sc of SCENARIOS) if (!sc.topic && TOPIC_DEFAULTS[sc.id]) sc.topic = TOPIC_DEFAULTS[sc.id];
 if (typeof module !== 'undefined') module.exports = SCENARIOS;
 
 /* ===== NETWORK NINJA :: game UI ===== */
@@ -2903,35 +4214,81 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
   const PATHS = [
     { id: 'queue', name: 'Contract queue', sub: 'Free play' },
     { id: 'jncia', name: 'JNCIA-aligned', sub: 'Associate · start here' },
-    { id: 'jncis', name: 'JNCIS-aligned', sub: 'Specialist · later', soon: true },
+    { id: 'jncis', name: 'JNCIS-aligned', sub: 'Specialist · new' },
     { id: 'jncip', name: 'JNCIP-aligned', sub: 'Professional · later', soon: true },
   ];
-  const QUEUE = ['T1', 'T2', 'T3', 'C1T1', 'C2T1'];
+  const QUEUE = ['T1', 'T2', 'T3', 'C1T1', 'C2T1', 'B31', 'C4T1', 'C4T2', 'IS1', 'IS2', 'IS3', 'IS4', 'IS5', 'IS6'];
   const JNCIA = [
     { n: 1, title: 'Junos CLI & config basics', blurb: 'Modes, the candidate config, commit, rollback, and the safety nets that save careers.', items: ['D1', 'D2', 'D3', 'D4', 'C1T1', 'D5', 'D6', 'D7', 'D8'] },
     { n: 2, title: 'Operational monitoring', blurb: 'Interface counters, logs, monitor, and extensive output. Reading the box before you touch it.', items: ['D21', 'D22', 'D23', 'D24', 'C2T1'] },
-    { n: 3, title: 'Networking fundamentals', blurb: 'Addressing, DHCP, VLANs, trunks, and the return path.', items: ['T1', 'T2', 'T3'] },
-    { n: 4, title: 'Routing fundamentals', blurb: 'Static routes, route preference, the routing table, and a first look at OSPF.', soon: true },
+    { n: 3, title: 'Networking fundamentals', blurb: 'Addressing, DHCP, VLANs, trunks, and the return path. Ends with your first build.', items: ['T1', 'T2', 'T3', 'B31'] },
+    { n: 4, title: 'Routing fundamentals', blurb: 'The routing table, longest match, hidden routes, route preference, and a first look at OSPF.', items: ['D41', 'C4T1', 'C4T2', 'D42', 'D43'] },
     { n: 5, title: 'Routing policy & firewall filters', blurb: 'Stateless filters on interfaces, and policies that decide which routes go where.', soon: true },
   ];
+  const JNCIS = [
+    { n: 1, title: 'Protocol-independent routing', blurb: 'Floating static routes, qualified next hops, and backups that actually take over.', items: ['IS1', 'IS2'] },
+    { n: 2, title: 'OSPF', blurb: 'Adjacencies, areas, MTU, passive interfaces, and why the routing table sometimes ignores OSPF.', items: ['IS3', 'IS4', 'IS5', 'IS6'] },
+    { n: 3, title: 'Layer 2 switching & spanning tree', blurb: 'Trunks in depth, RSTP and MSTP, root bridges, and loops that take a building down.', soon: true },
+    { n: 4, title: 'Layer 2 security', blurb: 'MAC limiting, DHCP snooping, storm control, and filters on switch ports.', soon: true },
+    { n: 5, title: 'BGP', blurb: 'eBGP to an ISP, iBGP inside, and the attributes that pick a path.', soon: true },
+    { n: 6, title: 'Tunnels & high availability', blurb: 'GRE, VRRP, BFD, and graceful restart.', soon: true },
+  ];
+  const CHAPTERS = {
+    jncia: { title: 'JNCIA-aligned path', list: JNCIA, intro: 'Built around the Junos associate-level topics. Drills are short and focused. Tickets are the real thing. Builds are design work: a spec instead of a complaint. This is practice, not official Juniper material.' },
+    jncis: { title: 'JNCIS-aligned path', list: JNCIS, intro: 'Specialist-level enterprise routing and switching. Fewer drills, trickier tickets, more design work. Assumes the JNCIA basics. Practice, not official Juniper material.' },
+  };
   const SOON = {
-    jncis: { title: 'JNCIS-aligned path', body: 'Spanning tree, Layer 2 security, OSPF and IS-IS, BGP basics, tunnels, and high availability. Rowdy gets quieter, and earned labels become optional.' },
     jncip: { title: 'JNCIP-aligned path', body: 'Advanced OSPF, IS-IS and BGP, routing policy in depth, multicast, and class of service. Coach off, no earned labels: you take your own notes, like the real thing.' },
   };
   const SC = id => SCENARIOS.find(s => s.id === id);
   const isDrill = s => !!s && s.kind === 'drill';
+  const isBuild = s => !!s && s.kind === 'design';
+  const prioLabel = s => (isDrill(s) ? ['drill', 'Drill'] : isBuild(s) ? ['build', 'Build'] : [s.priority.toLowerCase(), s.priority]);
+
+  /* ---------- ticket intro: what this ticket teaches and where it sits in the certs ---------- */
+  // Juniper doesn't publish objective weights, so Juniper tracks are named by objective area only.
+  // Cisco publishes CCNA 200-301 v1.1 domain weights; those are the percentages quoted here.
+  const CERTS = { jncia: ['JNCIA-Junos', 7], jncis: ['JNCIS-ENT', 9] };
+  const CCNA_PCT = { 'Network Fundamentals': 20, 'Network Access': 20, 'IP Connectivity': 25, 'IP Services': 10, 'Security Fundamentals': 15, 'Automation and Programmability': 10 };
+  const PCT_WORDS = { 25: 'a quarter', 20: 'a fifth', 10: 'a tenth', 15: 'about a seventh' };
+  const playerName = () => (typeof PLAYER !== 'undefined' && PLAYER.name) || 'ninja';
+  function topicTag(s) {
+    const t = s.topic;
+    if (!t) return null;
+    const ck = t.jncis ? 'jncis' : 'jncia', [cert, n] = CERTS[ck], obj = t[ck];
+    const pct = t.ccna && CCNA_PCT[t.ccna];
+    return {
+      html: `<span><b>Topic</b> ${esc(t.area)}</span><span><b>${cert}</b> ${esc(obj)}</span>${pct ? `<span><b>CCNA</b> ${esc(t.ccna)} · ${pct}%</span>` : ''}`,
+      title: `${cert}: one of ${n} exam objective areas (Juniper doesn't publish weights).${pct ? ` CCNA 200-301: ${t.ccna} is ${pct}% of the exam.` : ''}`,
+    };
+  }
+  function introLine(s) {
+    const t = s.topic;
+    if (!t) return null;
+    const nm = playerName();
+    const ck = t.jncis ? 'jncis' : 'jncia', [cert] = CERTS[ck], obj = t[ck];
+    const pct = t.ccna && CCNA_PCT[t.ccna];
+    const open = isDrill(s) ? pick([`Quick rep, ${nm}.`, `Warm-up time, ${nm}!`, `${nm}, grab your coffee.`, `Reps make ninjas, ${nm}.`])
+      : isBuild(s) ? pick([`Blueprint time, ${nm}.`, `${nm}, today you're the architect.`, `Hard hat on, ${nm}. Nothing's broken. Yet.`])
+      : s.priority === 'P1' ? pick([`Sirens on, ${nm}!`, `${nm}, the phones are melting.`, `Drop the onigiri, ${nm}. P1.`])
+      : pick([`Hey ${nm}, this one's fun and a little sneaky.`, `Okay ${nm}, deep breath.`, `${nm}! Fresh ticket, still warm.`, `This one's got layers, ${nm}. Like a good onion. Or a network.`]);
+    const where = pick([`Today's flavor: ${t.area}.`, `The subject is ${t.area}.`, `Think ${t.area}.`]);
+    const certBit = `That's the ${cert} "${obj}" objective`;
+    const ccnaBit = pct ? `, and on the Cisco side it's CCNA ${t.ccna}, ${PCT_WORDS[pct] || pct + '%'} of that exam.` : '.';
+    return `${open} ${where} ${certBit}${ccnaBit}`;
+  }
   const hintCost = () => (isDrill(G.scn) ? 25 : 75);
   const curPath = () => (PATHS.some(p => p.id === prog.path) ? prog.path : 'jncia');
 
   function itemCard(s, locked, lockMsg) {
     const done = prog.done[s.id];
     const drill = isDrill(s);
-    const c = el('article', 'card' + (drill ? ' drill' : '') + (locked ? ' locked' : '') + (done ? ' closed' : ''));
+    const c = el('article', 'card' + (drill ? ' drill' : '') + (isBuild(s) ? ' build' : '') + (locked ? ' locked' : '') + (done ? ' closed' : ''));
     const brief = s.brief.length > 120 ? s.brief.slice(0, s.brief.lastIndexOf(' ', 118)) + '…' : s.brief;
     c.innerHTML = `
       <div class="card-top">
         <span class="tkt">${esc(s.ticket)}</span>
-        <span class="prio ${drill ? 'drill' : s.priority.toLowerCase()}">${drill ? 'Drill' : esc(s.priority)}</span>
+        <span class="prio ${prioLabel(s)[0]}">${esc(prioLabel(s)[1])}</span>
         ${done ? `<span class="grade g-${done.grade}">${done.grade}</span>` : ''}
       </div>
       <h3>${esc(s.title)}</h3>
@@ -2940,7 +4297,8 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       <dl class="meta">${drill
         ? `<div><dt>Objectives</dt><dd>${s.objectives.length}</dd></div><div><dt>Pays</dt><dd>$${s.reward}</dd></div><div><dt>Hints</dt><dd>$25 ea</dd></div>`
         : `<div><dt>SLA</dt><dd>${s.sla} min</dd></div><div><dt>Pays</dt><dd>$${s.reward}</dd></div><div><dt>Change par</dt><dd>${s.par} line${s.par > 1 ? 's' : ''}</dd></div>`}</dl>`;
-    const b = el('button', 'btn ' + (done ? 'ghost' : 'primary'), locked ? 'Locked' : done ? (drill ? 'Replay drill' : 'Replay ticket') : (drill ? 'Start drill' : 'Take ticket'));
+    const noun = drill ? 'drill' : isBuild(s) ? 'build' : 'ticket';
+    const b = el('button', 'btn ' + (done ? 'ghost' : 'primary'), locked ? 'Locked' : done ? `Replay ${noun}` : drill ? 'Start drill' : isBuild(s) ? 'Take the build' : 'Take ticket');
     b.disabled = locked;
     b.addEventListener('click', () => { sfx.click(); startTicket(s.id); });
     c.appendChild(b);
@@ -2972,13 +4330,14 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       title.textContent = 'Contract queue';
       QUEUE.forEach((id, i) => q.appendChild(itemCard(SC(id), i > 0 && !prog.done[QUEUE[i - 1]], 'Close the previous ticket to unlock.')));
       note.textContent = `${QUEUE.filter(id => prog.done[id]).length} of ${QUEUE.length} tickets closed.`;
-    } else if (mode === 'jncia') {
+    } else if (CHAPTERS[mode]) {
+      const P = CHAPTERS[mode];
       q.className = 'chapters';
-      title.textContent = 'JNCIA-aligned path';
-      const all = JNCIA.flatMap(c => c.items || []);
+      title.textContent = P.title;
+      const all = P.list.flatMap(c => c.items || []);
       note.textContent = `${all.filter(id => prog.done[id]).length} of ${all.length} done · more chapters coming`;
-      q.appendChild(el('p', 'path-intro', 'Built around the Junos associate-level topics. Drills are short and focused. Tickets are the real thing. This is practice, not official Juniper material.'));
-      for (const ch of JNCIA) {
+      q.appendChild(el('p', 'path-intro', P.intro));
+      for (const ch of P.list) {
         const sec = el('section', 'chapter' + (ch.soon ? ' soon' : ''));
         const done = (ch.items || []).filter(id => prog.done[id]).length;
         sec.innerHTML = `<header class="ch-head"><span class="ch-n">${ch.n}</span><div><h3>${esc(ch.title)}</h3><p>${esc(ch.blurb)}</p></div><span class="ch-prog">${ch.soon ? 'Coming soon' : `${done} / ${ch.items.length}`}</span></header>`;
@@ -3304,6 +4663,8 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     renderMap();
     setHeat(null);
     hushMascots();
+    const intro = introLine(scn);
+    if (intro) setTimeout(() => { if (G && G.scn === scn) say('bitbyte', intro, { anim: 'jump', ms: 9000 }); }, 250);
     if (scn.villain) setTimeout(() => { if (G && G.scn === scn) say('interface', scn.villain, { anim: 'shake' }); }, 500);
     if (coachOn && scn.heat && !prog.coachIntro) {
       setTimeout(() => { if (G && G.scn === scn) say('rowdy', 'Hey! Rowdy here. Run a command and I\'ll yell if you\'re hot or cold. Click me to make me go away.', { anim: 'jump' }); }, 600);
@@ -3330,7 +4691,10 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
 
   function renderTicket() {
     const s = G.scn, drill = isDrill(s);
-    $('#t-head').innerHTML = `<span class="tkt">${esc(s.ticket)}</span><span class="prio ${drill ? 'drill' : s.priority.toLowerCase()}">${drill ? 'Drill' : esc(s.priority)}</span>`;
+    $('#t-head').innerHTML = `<span class="tkt">${esc(s.ticket)}</span><span class="prio ${prioLabel(s)[0]}">${esc(prioLabel(s)[1])}</span>`;
+    const tp = topicTag(s);
+    $('#t-topic').hidden = !tp;
+    if (tp) { $('#t-topic').innerHTML = tp.html; $('#t-topic').title = tp.title; }
     $('#t-title').textContent = s.title;
     $('#t-client').textContent = s.client;
     $('#t-brief').textContent = s.brief;
@@ -3346,6 +4710,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     ql.hidden = !(s.quotes && s.quotes.length);
     renderObjectives();
     $('#resolve-btn').hidden = drill;
+    $('#resolve-btn').textContent = isBuild(s) ? 'Submit for review' : 'Close ticket';
     $('#chgrow').hidden = drill;
     $('#heatrow').hidden = !coachOn || !s.heat;
     renderHints();
@@ -3402,6 +4767,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     printer: `<rect class="body" x="-13" y="-22" width="26" height="12"/><rect class="body" x="-23" y="-10" width="46" height="22" rx="3"/><rect class="body" x="-13" y="6" width="26" height="12"/><circle class="led" cx="15" cy="-3" r="2"/>`,
     scanner: `<rect class="body" x="-22" y="-14" width="36" height="16" rx="4"/><path class="body" d="M-4 2 L4 22 H14 L8 2 Z"/><path class="detail" d="M14 -10 L24 -14 M14 -2 L24 2"/>`,
     camera: `<rect class="body" x="-22" y="-12" width="34" height="22" rx="4"/><circle class="detail" cx="-5" cy="-1" r="6"/><path class="body" d="M12 -6 L24 -12 V10 L12 4 Z"/><path class="detail" d="M-5 10 V22 M-14 22 H4"/>`,
+    phone: `<rect class="body" x="-20" y="-6" width="40" height="22" rx="4"/><path class="body" d="M-22 -10 Q-22 -20 -12 -20 H12 Q22 -20 22 -10 V-6 H12 V-12 H-12 V-6 H-22 Z"/><path class="detail" d="M-10 2 H-4 M2 2 H8 M-10 9 H-4 M2 9 H8"/>`,
     xray: `<rect class="body" x="-22" y="-24" width="44" height="40" rx="3"/><path class="detail" d="M0 -16 V8 M-10 -12 Q0 -8 10 -12 M-12 -4 Q0 0 12 -4 M-10 4 Q0 8 10 4"/><path class="detail" d="M-14 16 V22 M14 16 V22 M-18 22 H18"/>`,
   };
 
@@ -3516,10 +4882,11 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
   /* ---------- terminal ---------- */
   const OP_TREE = {
     show: {
-      interfaces: { _end: true, terse: null, descriptions: null, '<interface>': { _end: true, terse: null, extensive: null } },
+      interfaces: { _end: true, terse: null, descriptions: null, '<interface>': { _end: true, terse: null, extensive: null, detail: null } },
       vlans: null,
       'ethernet-switching': { table: null },
-      route: { _end: true, '<destination>': null },
+      route: { _end: true, '<destination>': null, hidden: null, protocol: { static: null, ospf: null, direct: null, local: null } },
+      ospf: { neighbor: null, interface: null },
       arp: { _end: true, 'no-resolve': null },
       lldp: { neighbors: null },
       configuration: '<rest>',
@@ -3561,6 +4928,8 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     environment: 'Show power, temperature and fan status', monitor: 'Show real-time debugging information', interface: 'Show interface traffic in real time',
     statistics: 'Clear interface statistics', all: 'All interfaces', size: 'Size of request packets (0..65468 bytes)', 'do-not-fragment': "Don't fragment echo request packets (IPv4)",
     rapid: 'Send requests rapidly', interfaces: 'Interface information',
+    hidden: 'Show only hidden (unusable) routes', protocol: 'Show routes from one protocol', direct: 'Directly connected routes', local: 'Local addresses',
+    neighbor: 'Show OSPF neighbor status', detail: 'Display detailed output',
   });
 
   const nodeAt = path => { const r = RC.walkTree(RC.CFG_TREE, path); return r.ok ? r.node : null; };
@@ -3585,7 +4954,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     if (isEmbedded(d)) return `${d.name}:~$ `;
     return 'C:\\Users\\noc> ';
   }
-  const isEmbedded = d => ['printer', 'scanner', 'camera'].includes(d.type);
+  const isEmbedded = d => ['printer', 'scanner', 'camera', 'phone'].includes(d.type);
 
   function openTab(devId) {
     const d = G.net.dev[devId];
@@ -3831,11 +5200,17 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       switch (c1) {
         case 'interfaces':
           if (T[2] === 'descriptions') return showDescs(d);
-          if (T[2] && T[2] !== 'terse') return T[3] === 'terse' ? showTerse(d, T[2]) : T[3] === 'extensive' ? showExtensive(d, T[2]) : showIface(d, T[2]);
+          if (T[2] && T[2] !== 'terse') return T[3] === 'terse' ? showTerse(d, T[2]) : (T[3] === 'extensive' || T[3] === 'detail') ? showExtensive(d, T[2]) : showIface(d, T[2]);
           return showTerse(d);
         case 'vlans': return showVlans(d);
         case 'ethernet-switching': return showMac(d);
-        case 'route': return showRoute(d, T[2]);
+        case 'route':
+          if (T[2] === 'hidden') return showRoute(d, null, { hidden: true });
+          if (T[2] === 'protocol') return showRoute(d, null, { proto: T[3] });
+          return showRoute(d, T[2]);
+        case 'ospf':
+          if (!d.model.ospf) return ['OSPF instance is not running'];
+          return T[2] === 'interface' ? showOspfIf(d) : showOspfNbr(d);
         case 'arp': return showArp(d, T[2] === 'no-resolve');
         case 'lldp': return showLldp(d);
         case 'configuration':
@@ -3880,6 +5255,8 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       '  show system uptime               show chassis environment',
       '  ping <ip> size <n> do-not-fragment',
       '  show configuration | compare rollback <n>',
+      '  show route hidden                show route protocol <static|ospf|direct>',
+      '  show ospf neighbor               show ospf interface',
       'Pipes: | match <text>  | except <text>  | count  | last <n>',
       'Keys: Tab completes, ? lists options, ↑/↓ history',
     ];
@@ -3966,31 +5343,66 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     ];
   }
 
-  function showRoute(d, dest) {
+  function showRoute(d, dest, opt = {}) {
     const net = G.net;
-    let rt = RC.routeTable(net, d).filter(r => !r.hidden);
-    const hidden = RC.routeTable(net, d).filter(r => r.hidden).length;
+    const all = RC.routeTable(net, d);
+    let rt = all.filter(r => (opt.hidden ? r.hidden : !r.hidden));
+    if (opt.proto) rt = rt.filter(r => r.type.toLowerCase() === opt.proto);
     if (dest) {
       const c = RC.parseCidr(dest);
       if (c) rt = rt.filter(r => r.net === RC.netAddr(c.ip, c.prefix) && r.prefix === c.prefix);
       else {
         const ip = ip2n(dest);
         let best = null;
-        for (const r of rt) if (RC.inSubnet(ip, r.net, r.prefix) && (!best || r.prefix > best.prefix)) best = r;
-        rt = best ? [best] : [];
+        for (const r of rt) if (r.active && RC.inSubnet(ip, r.net, r.prefix) && (!best || r.prefix > best.prefix)) best = r;
+        rt = best ? rt.filter(r => r.net === best.net && r.prefix === best.prefix) : [];
       }
     }
-    const age = r => (r.type === 'Static' && !d.original.some(l => l.includes('route ' + n2ip(r.net) + '/' + r.prefix + ' ')) ? '00:00:' + String(Math.floor(rnd(10, 59))) : '3d 02:14:07');
-    const L = [`inet.0: ${rt.length} destinations, ${rt.length} routes (${rt.length} active, 0 holddown, ${dest ? 0 : hidden} hidden)`,
+    const fresh = r => r.type === 'Static' && !d.original.some(l => l.includes('route ' + n2ip(r.net) + '/' + r.prefix + ' ') && l.includes(n2ip(r.nh)));
+    const age = r => (fresh(r) || (r.type === 'OSPF' && G.ospfFresh && G.ospfFresh.has(d.id)) ? '00:00:' + String(Math.floor(rnd(10, 59))) : '3d 02:14:07');
+    const dests = new Set(rt.map(r => r.net + '/' + r.prefix));
+    const active = rt.filter(r => r.active || r.type === 'Local').length;
+    const hidden = all.filter(r => r.hidden).length;
+    const L = [`inet.0: ${dests.size} destinations, ${rt.length} routes (${opt.hidden ? 0 : active} active, 0 holddown, ${opt.hidden ? rt.length : dest ? 0 : hidden} hidden)`,
       '+ = Active Route, - = Last Active, * = Both', ''];
+    let last = null;
     for (const r of rt) {
-      const pref = r.type === 'Static' ? 5 : 0;
-      L.push(pad(`${n2ip(r.net)}/${r.prefix}`, 19) + `*[${r.type}/${pref}] ${age(r)}`);
-      if (r.type === 'Static') L.push(`                    >  to ${n2ip(r.nh)} via ${r.iface.name}`);
+      const k = r.net + '/' + r.prefix;
+      const mark = r.active || r.type === 'Local' ? '*' : ' ';
+      const head = `${mark}[${r.type}/${r.pref}] ${age(r)}${r.type === 'OSPF' ? `, metric ${r.metric}` : ''}`;
+      L.push((k === last ? ' '.repeat(19) : pad(`${n2ip(r.net)}/${r.prefix}`, 19)) + head);
+      last = k;
+      if (r.hidden) L.push(`                       Unusable`);
+      else if (r.type === 'Static' || r.type === 'OSPF') L.push(`                    >  to ${n2ip(r.nh)} via ${r.iface.name}`);
       else if (r.type === 'Direct') L.push(`                    >  via ${r.iface.name}`);
       else L.push(`                       Local via ${r.iface.name}`);
     }
-    if (dest && !rt.length) return [];
+    if ((dest || opt.proto || opt.hidden) && !rt.length) return opt.hidden ? [L[0], L[1]] : [];
+    return L;
+  }
+
+  function showOspfNbr(d) {
+    const o = RC.ospf(G.net)[d.id];
+    const L = [pad('Address', 17) + pad('Interface', 23) + pad('State', 16) + pad('ID', 17) + pad('Pri', 5) + 'Dead'];
+    for (const n of (o ? o.nbrs : [])) L.push(pad(n2ip(n.addr), 17) + pad(n.iface, 23) + pad(n.state, 16) + pad(n2ip(n.rid), 17) + pad('128', 5) + String(31 + (RC.hash(d.id + n.dev) % 9)));
+    return L;
+  }
+  function showOspfIf(d) {
+    const net = G.net, o = RC.ospf(net)[d.id];
+    const L = [pad('Interface', 20) + pad('State', 8) + pad('Area', 16) + pad('DR ID', 16) + pad('BDR ID', 16) + 'Nbrs'];
+    for (const i of (o ? o.oifs : [])) {
+      const nb = o.nbrs.filter(n => n.iface === i.name);
+      let st = 'Down', dr = '0.0.0.0', bdr = '0.0.0.0';
+      if (i.l3) {
+        if (!i.l3.start) { st = 'DR'; dr = n2ip(o.rid); }
+        else {
+          const ids = [o.rid, ...nb.map(n => n.rid)].sort((a, b) => b - a);
+          st = ids[0] === o.rid ? 'DR' : ids[1] === o.rid ? 'BDR' : 'DRother';
+          dr = n2ip(ids[0]); bdr = ids[1] !== undefined ? n2ip(ids[1]) : '0.0.0.0';
+        }
+      }
+      L.push(pad(i.name, 20) + pad(st, 8) + pad(i.area, 16) + pad(dr, 16) + pad(bdr, 16) + String(nb.length).padStart(4));
+    }
     return L;
   }
 
@@ -4145,6 +5557,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
 
   async function doPing(s, d, dst, count, opts = {}) {
     const net = G.net;
+    if ((RC.isNet(d) || isEmbedded(d)) && ip2n(dst) === null) { print(s, `ping: cannot resolve ${dst}: Host name lookup failure`, 'err'); print(s, '(simulator: no DNS server is configured on network gear here. Use the IP address.)', 'dim'); return; }
     const res = RC.ping(net, d.id, dst, opts);
     if (res.reason === 'mtu') bumpCtr(res.at, 'oversize', count);
     const anim = animatePing(res);
@@ -4317,7 +5730,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       if (!s.path.length) { print(s, 'warning: already at top of configuration hierarchy', 'warn'); }
       else {
         s.path.pop();
-        if (['unit', 'route'].includes(s.path[s.path.length - 1])) s.path.pop();
+        if (['unit', 'route', 'area', 'interface', 'qualified-next-hop'].includes(s.path[s.path.length - 1])) s.path.pop();
         const n = nodeAt(s.path);
         if (n && typeof n === 'object' && Object.keys(n).every(k => k.startsWith('<'))) s.path.pop();
       }
@@ -4406,8 +5819,10 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       logEv({ ev: 'commit', dev: d.model.hostname, removed: df.removed, added: df.added, confirmed: sub === 'confirmed' });
       const passBefore = passCount();
       const prev = d.committed.slice();
+      const ospfBefore = ospfSnap();
       RC.commitDevice(G.net, d, d.candidate);
       d.candidate = d.committed.slice();
+      ospfLogChanges(ospfBefore, ospfSnap(), stamp);
       d.commitLog.unshift({ user: 'noc', when: stampFull(), comment, note: sub === 'confirmed' ? `commit confirmed, rollback in ${m}mins` : '' });
       if (sub === 'confirmed') { armConfirm(d, m, prev); print(s, `commit confirmed will be automatically rolled back in ${m} minutes unless confirmed`); }
       print(s, 'commit complete', 'ok');
@@ -4424,13 +5839,37 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     }
   }
 
+  // OSPF neighbor bookkeeping so commits write realistic rpd log lines on every router involved.
+  function ospfSnap() {
+    const m = new Map();
+    const R = RC.ospf(G.net);
+    for (const r of Object.values(R)) for (const n of r.nbrs) m.set(`${r.id}|${n.iface}|${n.dev}`, { r, n });
+    return m;
+  }
+  function ospfLogChanges(before, after, stamp) {
+    const line = (devId, n, from, to, why) => {
+      const d = G.net.dev[devId];
+      d.logLines.push(`${stamp}  ${d.model.hostname} rpd[1612]: ${to === 'Full' ? 'RPD_OSPF_NBRUP' : 'RPD_OSPF_NBRDOWN'}: OSPF neighbor ${n2ip(n.addr)} (realm ospf-v2 ${n.iface} area ${n.area}) state changed from ${from} to ${to} due to ${why}`);
+      G.ospfFresh = G.ospfFresh || new Set();
+      G.ospfFresh.add(devId);
+    };
+    for (const [k, a] of after) {
+      const b = before.get(k);
+      if (a.n.state === 'Full' && (!b || b.n.state !== 'Full')) line(a.r.id, a.n, b ? b.n.state : 'Init', 'Full', 'LoadDone (event reason: OSPF loadDone)');
+    }
+    for (const [k, b] of before) {
+      const a = after.get(k);
+      if (b.n.state === 'Full' && (!a || a.n.state !== 'Full')) line(b.r.id, b.n, 'Full', a ? a.n.state : 'Down', a ? 'SeqNumMismatch (event reason: DBD exchange of master/slave failed)' : 'KillNbr (event reason: interface went down)');
+    }
+  }
+
   function compareLines(a, b) {
     const df = RC.configDiff(a, b);
     if (!df.added.length && !df.removed.length) return [];
     const groups = new Map();
     const put = (l, sign) => {
       const t = RC.tokenize(l).slice(1);
-      const split = RC.VALUE_KEYS.has(t[t.length - 2]) ? t.length - 2 : t.length - 1;
+      const split = (RC.VALUE_KEYS.has(t[t.length - 2]) || ['interface', 'qualified-next-hop'].includes(t[t.length - 2])) ? t.length - 2 : t.length - 1;
       const head = '[edit ' + t.slice(0, split).join(' ') + ']';
       if (!groups.has(head)) groups.set(head, []);
       groups.get(head).push(`${sign}   ${t.slice(split).join(' ')};`);
@@ -4604,9 +6043,9 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     logEv({ ev: 'verify', ok: allOk, results });
     const act = card.querySelector('#chk-actions');
     if (allOk) {
-      const p = el('p', 'note ok', 'Everything works. Now tell the customer why it broke.');
+      const p = el('p', 'note ok', isBuild(G.scn) ? 'Every requirement passes. Time for the design review.' : 'Everything works. Now tell the customer why it broke.');
       card.insertBefore(p, act);
-      const b = el('button', 'btn primary', 'File root cause report');
+      const b = el('button', 'btn primary', isBuild(G.scn) ? 'Start design review' : 'File root cause report');
       b.addEventListener('click', rcaForm);
       act.appendChild(b);
       b.focus();
@@ -4624,8 +6063,8 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
 
   function rcaForm() {
     const opts = G.scn.rca.options.map((o, i) => ({ ...o, i })).sort(() => Math.random() - 0.5);
-    const card = modal(`<p class="eyebrow">Root cause report · ${esc(G.scn.ticket)}</p><h2>${esc(G.scn.rca.question)}</h2>
-      <p class="sub">The fix is in. Pick the cause, not the symptom. A wrong answer halves the payout.</p>
+    const card = modal(`<p class="eyebrow">${isBuild(G.scn) ? 'Design review' : 'Root cause report'} · ${esc(G.scn.ticket)}</p><h2>${esc(G.scn.rca.question)}</h2>
+      <p class="sub">${isBuild(G.scn) ? 'It works. Now defend the design. A wrong answer halves the payout.' : 'The fix is in. Pick the cause, not the symptom. A wrong answer halves the payout.'}</p>
       <form id="rca-form" class="rca">${opts.map((o, k) => `<label class="opt"><input type="radio" name="rca" id="rca-${k}" value="${o.i}"><span>${esc(o.t)}</span></label>`).join('')}
       <div class="modal-actions"><button class="btn primary" type="submit" id="rca-submit" disabled>Submit report</button></div></form>`);
     const form = card.querySelector('form');
@@ -4651,7 +6090,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     const replay = !!prog.done[s.id];
     const lines = [
       ['Ticket payout', s.reward],
-      [rcaOk ? 'Root cause correct' : 'Root cause wrong (half pay)', rcaOk ? 0 : -Math.round(s.reward / 2)],
+      [isBuild(s) ? (rcaOk ? 'Design review passed' : 'Design review failed (half pay)') : rcaOk ? 'Root cause correct' : 'Root cause wrong (half pay)', rcaOk ? 0 : -Math.round(s.reward / 2)],
       [underSla ? 'Inside SLA (+25%)' : 'SLA breached', underSla ? Math.round(s.reward * 0.25) : 0],
       [underPar ? `Clean change, ${changes} line${changes === 1 ? '' : 's'} (+15%)` : `Changed ${changes} lines (par ${s.par})`, underPar ? Math.round(s.reward * 0.15) : 0],
     ];
@@ -4695,7 +6134,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       <div class="debrief-head">
         <div class="bigGrade g-${grade}">${grade}</div>
         <div><p class="eyebrow">${esc(s.ticket)} closed · ${mm}</p><h2>${esc(s.title)}</h2>
-        <p class="sub">${rcaOk ? 'Root cause confirmed. The customer got the real answer.' : 'Fixed, but the report missed the real cause. Expect a callback.'}</p></div>
+        <p class="sub">${isBuild(s) ? (rcaOk ? 'Built to spec, and you can explain why. That is design.' : 'It works, but the review didn\'t go well. Know why your design works.') : rcaOk ? 'Root cause confirmed. The customer got the real answer.' : 'Fixed, but the report missed the real cause. Expect a callback.'}</p></div>
       </div>
       <div class="debrief-grid">
         <div>
@@ -4706,7 +6145,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
           ${kageTags.length ? `<p class="kage-note"><b>Kage noticed</b>${esc(kageTags.join(' · '))}</p>` : ''}
           ${myChanges.length ? `<p class="eyebrow">Your change</p><pre class="diff">${esc(myChanges.join('\n'))}</pre>` : ''}
         </div>
-        <div class="story"><p class="eyebrow">What actually happened</p>${s.debrief.map(p => `<p>${esc(p)}</p>`).join('')}</div>
+        <div class="story"><p class="eyebrow">${isBuild(s) ? 'Why this design' : 'What actually happened'}</p>${s.debrief.map(p => `<p>${esc(p)}</p>`).join('')}</div>
       </div>
       <div class="modal-actions"><button class="btn primary" id="to-queue">Back to queue</button></div>`, 'wide');
     card.querySelector('#to-queue').addEventListener('click', () => { closeModal(); showBoard(); });
