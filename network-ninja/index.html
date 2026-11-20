@@ -4534,7 +4534,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
           b.type = 'button';
           b.title = 'Show the command (−$10)';
           b.setAttribute('aria-label', 'Show the command for this objective, costs $10');
-          b.addEventListener('click', () => { G.peeked.add(i); G.peeks++; logEv({ ev: 'peek', n: i + 1 }); renderObjectives(); if (G.peeks === 2) say('interface', 'Peeking at the answers? I peek at your configs. We\'re practically the same.', { anim: 'shake' }); });
+          b.addEventListener('click', () => { G.peeked.add(i); G.peeks++; G.lastAct = Date.now(); logEv({ ev: 'peek', n: i + 1 }); renderObjectives(); if (G.peeks === 2) say('interface', 'Peeking at the answers? I peek at your configs. We\'re practically the same.', { anim: 'shake' }); });
           li.appendChild(b);
         }
       }
@@ -4717,6 +4717,79 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     renderChanges();
   }
 
+  /* ---------- BitByte beginner nudges (JNCIA + contract queue; JNCIS assumes the basics) ---------- */
+  const HINT_GAP = 45; // seconds between hints, so each one gets a fair try
+  const nudgeOn = () => G && !/^IS\d/.test(G.scn.id);
+  function nudge(kind, text, max = 2) {
+    if (!nudgeOn()) return;
+    G.nudges = G.nudges || {};
+    const n = G.nudges[kind] || 0;
+    if (n >= max) return;
+    G.nudges[kind] = n + 1;
+    logEv({ ev: 'nudge', kind });
+    setTimeout(() => { if (G) say('bitbyte', text, { anim: 'jump', interrupt: true, ms: 11000 }); }, 650);
+  }
+  const OP_ONLY = ['request', 'ping', 'traceroute', 'monitor', 'clear', 'configure'];
+  function beginnerNudge(s, d, line, modeBefore) {
+    if (!nudgeOn() || !line) return;
+    const err = String(s.errNote || '');
+    const toks = RC.tokenize(line.split('|')[0]);
+    const w = toks[0] || '';
+    if (RC.isHost(d)) {
+      if (err && /^(show|set|configure|edit|commit|request)/.test(w)) nudge('pc', `${d.name} is a Windows PC, so it speaks ipconfig, ping, tracert and arp -a. For Junos, click a switch or router on the map.`);
+      return;
+    }
+    if (err && /^(ipconfig|ifconfig|ip|tracert|netsh)$/.test(w)) { nudge('winonjunos', `${w} is a Windows command. On Junos, show interfaces terse lists the ports and their state, and show arp no-resolve lists the neighbors it can see.`); return; }
+    // value names are case-sensitive: parking is not PARKING
+    const mi = toks.indexOf('members');
+    if (modeBefore === 'cfg' && mi > 0 && toks[mi + 1]) {
+      const v = toks[mi + 1];
+      const names = Object.keys(Object.assign({}, RC.parseConfig(d.committed).vlans, RC.parseConfig(d.candidate || []).vlans));
+      const twin = names.find(n => n !== v && n.toLowerCase() === v.toLowerCase());
+      if (twin && !names.includes(v)) { nudge('case', `Careful: Junos names are case-sensitive. The VLAN is ${twin}, and ${v} would be a different (empty) VLAN. run show vlans lists the exact names.`); return; }
+    }
+    if (!err) return;
+    if (/edit requires a configuration hierarchy/.test(err)) {
+      nudge('edit', 'edit moves you into a section, like opening a folder: edit interfaces ge-0/0/3. set gives something a value: set description "kitchen tablet". You ended on a value, so use set.');
+      return;
+    }
+    if (modeBefore === 'cfg') {
+      if (/^comm?i?t?$/.test(w) && toks.includes('rescue')) { nudge('rescue', 'Rescue has two halves. Saving one is operational: request system configuration rescue save. Loading it back is in config mode: rollback rescue, then commit.'); return; }
+      if (/^compare$/.test(w) || /\| *(rollback|commit)/.test(line)) { nudge('compare', 'Compare goes after a pipe. In config mode: show | compare rollback 1. In operational mode: show configuration | compare rollback 1.'); return; }
+      const asOp = RC.walkTree(OP_TREE, toks);
+      if (OP_ONLY.some(k => k.startsWith(w) && w.length >= 2) || (asOp.ok && asOp.tokens && asOp.tokens[0] === 'show')) {
+        nudge('mode', `You're in configuration mode (the # prompt), and that's an operational command. Put run in front: run ${line}. Or type exit to go back to the > prompt.`);
+        return;
+      }
+    } else if (/^(set|delete|del|commit|commi|rollback|top|up)$/.test(w) || /^(se|de)$/.test(w)) {
+      nudge('mode', 'set, delete, commit and rollback live in configuration mode. Type configure (or edit) first. The prompt changes from > to #.');
+      return;
+    }
+    if (/is ambiguous|expecting <command>|missing argument/.test(err)) nudge('qmark', 'Not sure what comes next? Type ? at the end of what you have, and Junos lists every option. Tab or Space finishes a word for you.', 1);
+  }
+  function idleNudge() {
+    if (!nudgeOn() || G.drillDone || !$('#modal').hidden) return;
+    const quiet = (Date.now() - (G.lastAct || G.t0)) / 1000;
+    G.idleCount = G.idleCount || 0;
+    if (quiet < 180 || G.idleCount >= 2) return;
+    G.idleCount++;
+    G.lastAct = Date.now();
+    if (isDrill(G.scn)) {
+      const i = G.scn.objectives.findIndex((o, k) => !G.objDone[k] && !G.answers[k]);
+      const o = G.scn.objectives[i];
+      if (!o) return;
+      nudge('idle' + G.idleCount, o.cmd && !G.peeked.has(i)
+        ? `Stuck on "${o.t}"? Tap the ? beside it to see the command. It costs $10, and that's cheaper than staring.`
+        : `Next up: "${o.t}". Read the last output again. The answer is usually sitting right there.`, 1);
+    } else {
+      const left = G.scn.hints.length - G.hints;
+      nudge('idle' + G.idleCount, left
+        ? 'Quiet for a while. A good first move: sit in the user\'s seat. Open their device, run ipconfig, and ping what they can\'t reach. Or grab a hint, no shame.'
+        : 'Read the last hint again slowly, and use ? to explore the command it mentions.', 1);
+    }
+  }
+  const hintWait = () => (G && G.hints > 0 && G.lastHintAt ? Math.max(0, HINT_GAP - Math.floor((Date.now() - G.lastHintAt) / 1000)) : 0);
+
   function renderHints(fresh) {
     const box = $('#t-hints');
     box.innerHTML = '';
@@ -4728,8 +4801,9 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     });
     const b = $('#hint-btn');
     const left = G.scn.hints.length - G.hints;
-    b.disabled = left === 0;
-    b.textContent = left ? `Get a hint (−$${hintCost()}) · ${left} left` : 'No hints left';
+    const wait = left ? hintWait() : 0;
+    b.disabled = left === 0 || wait > 0;
+    b.textContent = !left ? 'No hints left' : wait ? `Next hint in ${wait}s · try this one first` : `Get a hint (−$${hintCost()}) · ${left} left`;
     if (fresh && box.lastElementChild) box.lastElementChild.scrollIntoView({ block: 'nearest', behavior: reduceMotion ? 'auto' : 'smooth' });
   }
 
@@ -4743,6 +4817,8 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
 
   function tick() {
     if (!G) return;
+    if (G.lastHintAt && G.hints < G.scn.hints.length && (hintWait() > 0 || G.hintWaitShown)) { renderHints(false); G.hintWaitShown = hintWait() > 0; }
+    idleNudge();
     const el2 = Math.floor((Date.now() - G.t0) / 1000);
     const t = $('#t-timer');
     const fmt = x => `${String(Math.floor(Math.abs(x) / 60)).padStart(2, '0')}:${String(Math.abs(x) % 60).padStart(2, '0')}`;
@@ -5116,6 +5192,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       G.errs++;
       if (G.errs === 1 || G.errs % 3 === 0) say('interface', pick(['Typos! My favorite snack.', 'Syntax error? Delicious. (Psst: ? lists what can come next. Not that I want you to know.)', 'Junos has thirty years of docs and you went with THAT?', 'Do it again. I wasn\'t ready to laugh the first time.', 'The CLI rejected you. Join the club. We have jackets.', 'Tab completes words. Not that you\'d use it. Heh.']), { anim: 'shake', interrupt: true });
     }
+    if (G && line.trim()) { G.lastAct = Date.now(); try { beginnerNudge(s, G.net.dev[s.dev], line.trim(), modeBefore); } catch (e) { console.error(e); } }
     if (G) flushFacts();
     if (line.trim()) logEv(Object.assign({ ev: 'cmd', dev: G ? G.net.dev[s.dev].name : '?', mode: modeBefore, cmd: line.trim().slice(0, 300) }, s.errNote ? { err: String(s.errNote).trim().slice(0, 160) } : {}, heat ? { heat: heat.h } : {}));
     s.busy = false;
@@ -6209,7 +6286,10 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     });
     $('#hint-btn').addEventListener('click', () => {
       if (!G || G.hints >= G.scn.hints.length) return;
+      if (hintWait() > 0) return;
       G.hints++;
+      G.lastHintAt = Date.now();
+      G.lastAct = Date.now();
       logEv({ ev: 'hint', n: G.hints });
       renderHints(true);
       say('bitbyte', `Hint ${G.hints} of ${G.scn.hints.length}: ${G.scn.hints[G.hints - 1]}`, { interrupt: true });
