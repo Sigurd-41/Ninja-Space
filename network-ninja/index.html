@@ -1827,7 +1827,7 @@ const SCENARIOS = [
     ],
     links: [['sw:ge-0/0/1', 'prn:eth0'], ['sw:ge-0/0/2', 'pc:eth0']],
     objectives: [
-      { t: 'Find out who committed what, and when', cmd: 'show system commit', test: X => X.ran(/^show system commit/) },
+      { t: 'Show the commit history: who committed, when, and their comment', cmd: 'show system commit  (or: show log messages | match UI_COMMIT)', test: X => X.ran(/^show system commit/) || X.ranPiped(/^show log messages/, /commit/i) },
       { t: 'See exactly what the last commit changed', cmd: 'show configuration | compare rollback 1', test: X => X.compared(1) },
       { t: 'Load the previous config into your draft', cmd: 'rollback 1  (in configuration mode)', test: X => X.ranCfg(/^rollback 1$/) },
       { t: 'Make it live, and the printer comes back', cmd: 'commit', test: X => X.same(X.d('sw').committed, X.snap('sw')) },
@@ -1865,6 +1865,9 @@ const SCENARIOS = [
       { id: 'pc', type: 'pc', name: 'Branch-PC', x: 500, y: 430, nic: { ip: '10.60.10.50/24', gw: '10.60.10.1' } },
     ],
     links: [['inet:ge-0/0/0', 'rtr:ge-0/0/0'], ['rtr:ge-0/0/1', 'pc:eth0']],
+    nudges: [
+      { re: /^confirm\b/, say: 'Junos has no confirm command. A plain commit (or commit check) is the confirmation.' },
+    ],
     objectives: [
       { t: 'Make a harmless change: a description on ge-0/0/1', cmd: 'set interfaces ge-0/0/1 description "LAN"', test: X => X.cand('rtr', /^set interfaces ge-0\/0\/1 description /) },
       { t: 'Commit it with a 1-minute automatic rollback', cmd: 'commit confirmed 1', test: X => X.ev('confirmed', 'rtr') },
@@ -1910,6 +1913,10 @@ const SCENARIOS = [
       { id: 'pc', type: 'pc', name: 'Front-PC', x: 640, y: 440, nic: { dhcp: true, offset: 40 } },
     ],
     links: [['sw:ge-0/0/1', 'srv:eth0'], ['sw:ge-0/0/2', 'pc:eth0']],
+    nudges: [
+      { re: /^rollback [1-9]/, say: 'rollback 1 works too, and in real life it is often the right move. This drill is about the rescue file, though. If you already fixed it, break it again (delete ge-0/0/2, commit) and recover with rollback rescue.', when: g => g.ev.some(e => e.t === 'commit') },
+      { re: /^load\b/, say: 'Close! On Junos the rescue file comes back with rollback rescue, in configuration mode. (load override with the file path works too, but rollback rescue is the one to remember.)' },
+    ],
     objectives: [
       { t: 'Save the current config as the rescue config', cmd: 'request system configuration rescue save', test: X => X.ev('rescue-save', 'sw') },
       { t: 'Look at the rescue config you saved', cmd: 'show system configuration rescue', test: X => X.ran(/^show system configuration rescue/) },
@@ -4070,6 +4077,22 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     if (!heat) return null;
     if (!coachOn || heat.h === 0) return heat;
     const sig = s.dev + '|' + key;
+    // Three different warm commands in a row on the same PC or server: it has told you all it knows.
+    const d = G.net.dev[s.dev];
+    if (G.lastSig !== sig) {
+      if (heat.h === 1 && G.warmRun && G.warmRun.dev === s.dev) G.warmRun.n++;
+      else G.warmRun = heat.h === 1 ? { dev: s.dev, n: 1 } : null;
+    }
+    G.cooled = G.cooled || new Set();
+    if (G.warmRun && G.warmRun.n >= 3 && RC.isHost(d) && !G.cooled.has(s.dev)) {
+      G.cooled.add(s.dev);
+      G.warmRun = null;
+      const cooled = { h: -1, say: [`You've squeezed ${d.name} dry. Whatever's wrong isn't on this box. Look upstream: the switch it plugs into, or its gateway.`] };
+      setHeat(-1);
+      G.lastSig = sig;
+      say('rowdy', cooled.say[0], { heat: -1, interrupt: true });
+      return cooled;
+    }
     setHeat(heat.h);
     if (G.lastSig === sig) return heat;
     G.lastSig = sig;
@@ -4167,7 +4190,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
   }
   function logEnd(fields) {
     if (!LOG.doc) return;
-    Object.assign(LOG.doc, fields, { elapsedSec: elapsed(), endedAt: new Date().toISOString() });
+    Object.assign(LOG.doc, fields, { elapsedSec: elapsed(), activeSec: G ? Math.min(G.activeSec || 0, elapsed()) : LOG.doc.activeSec || 0, endedAt: new Date().toISOString() });
     LOG.dirty = true;
     clearTimeout(LOG.timer);
     logFlush();
@@ -4484,6 +4507,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     const dv = id => G.net.dev[id];
     return {
       ran: (re, dev) => G.cmds.some(c => !c.err && re.test(c.key) && (!dev || c.dev === dev)),
+      ranPiped: (re, pipeRe) => G.cmds.some(c => !c.err && re.test(c.key) && c.mods && pipeRe.test(JSON.stringify(c.mods))),
       ranCfg: (re, dev) => G.cmds.some(c => !c.err && c.mode === 'cfg' && re.test(c.key) && (!dev || c.dev === dev)),
       compared: n => G.cmds.some(c => !c.err && c.mods && c.mods.compare && (n === undefined || (c.mods.compareN || 0) === n)),
       ev: (t, dev) => G.ev.some(e => e.t === t && (!dev || e.dev === dev)),
@@ -4748,6 +4772,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       const twin = names.find(n => n !== v && n.toLowerCase() === v.toLowerCase());
       if (twin && !names.includes(v)) { nudge('case', `Careful: Junos names are case-sensitive. The VLAN is ${twin}, and ${v} would be a different (empty) VLAN. run show vlans lists the exact names.`); return; }
     }
+    for (const n of G.scn.nudges || []) if (n.re.test(line) && (!n.when || n.when(G))) { nudge('scn' + n.re.source, n.say, 1); return; }
     if (!err) return;
     if (/edit requires a configuration hierarchy/.test(err)) {
       nudge('edit', 'edit moves you into a section, like opening a folder: edit interfaces ge-0/0/3. set gives something a value: set description "kitchen tablet". You ended on a value, so use set.');
@@ -4757,7 +4782,8 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       if (/^comm?i?t?$/.test(w) && toks.includes('rescue')) { nudge('rescue', 'Rescue has two halves. Saving one is operational: request system configuration rescue save. Loading it back is in config mode: rollback rescue, then commit.'); return; }
       if (/^compare$/.test(w) || /\| *(rollback|commit)/.test(line)) { nudge('compare', 'Compare goes after a pipe. In config mode: show | compare rollback 1. In operational mode: show configuration | compare rollback 1.'); return; }
       const asOp = RC.walkTree(OP_TREE, toks);
-      if (OP_ONLY.some(k => k.startsWith(w) && w.length >= 2) || (asOp.ok && asOp.tokens && asOp.tokens[0] === 'show')) {
+      if (/pipe/.test(err)) return;
+      if (OP_ONLY.some(k => k.startsWith(w) && w.length >= 2) || (asOp.ok && asOp.tokens && asOp.tokens[0] === 'show' && asOp.tokens.length > 1)) {
         nudge('mode', `You're in configuration mode (the # prompt), and that's an operational command. Put run in front: run ${line}. Or type exit to go back to the > prompt.`);
         return;
       }
@@ -4769,11 +4795,11 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
   }
   function idleNudge() {
     if (!nudgeOn() || G.drillDone || !$('#modal').hidden) return;
-    const quiet = (Date.now() - (G.lastAct || G.t0)) / 1000;
+    const quiet = (Date.now() - Math.max(G.lastAct || G.t0, G.lastIdleNudge || 0)) / 1000;
     G.idleCount = G.idleCount || 0;
     if (quiet < 180 || G.idleCount >= 2) return;
     G.idleCount++;
-    G.lastAct = Date.now();
+    G.lastIdleNudge = Date.now();
     if (isDrill(G.scn)) {
       const i = G.scn.objectives.findIndex((o, k) => !G.objDone[k] && !G.answers[k]);
       const o = G.scn.objectives[i];
@@ -4817,6 +4843,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
 
   function tick() {
     if (!G) return;
+    if (document.visibilityState === 'visible' && Date.now() - (G.lastAct || G.t0) < 120000) G.activeSec = (G.activeSec || 0) + 1;
     if (G.lastHintAt && G.hints < G.scn.hints.length && (hintWait() > 0 || G.hintWaitShown)) { renderHints(false); G.hintWaitShown = hintWait() > 0; }
     idleNudge();
     const el2 = Math.floor((Date.now() - G.t0) / 1000);
@@ -5632,6 +5659,22 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
   /* ---------- ping / traceroute ---------- */
   const ms = (n, a = 0.6, b = 2.4) => rnd(a + n * 0.4, b + n * 0.9);
 
+  // Name lookup for PCs and servers. Junos gear has no DNS server configured, so it never resolves.
+  // A PC needs a working address and a DNS server (DHCP hands one out); names match any device on the map.
+  function resolveName(d, name) {
+    const net = G.net;
+    const a = RC.hostAddr(net, d.id);
+    if (!a || !a.up || a.apipa || a.dns === null || a.dns === undefined) return null;
+    const want = String(name).toLowerCase().replace(/\.(local|lan|corp)$/, '');
+    const t = Object.values(net.dev).find(x => x.type !== 'cloud' && String(x.name || (x.model && x.model.hostname) || '').toLowerCase() === want)
+      || Object.values(net.dev).find(x => x.model && String(x.model.hostname || '').toLowerCase() === want);
+    if (!t) return null;
+    if (RC.isHost(t)) { const ta = RC.hostAddr(net, t.id); return ta && ta.up && !ta.apipa ? n2ip(ta.ip) : null; }
+    const ifs = RC.l3Ifaces(net, t);
+    const pick1 = ifs.find(i => i.name.startsWith('lo0')) || ifs.find(i => i.name.startsWith('irb')) || ifs[0];
+    return pick1 ? n2ip(pick1.ip) : null;
+  }
+
   async function doPing(s, d, dst, count, opts = {}) {
     const net = G.net;
     if ((RC.isNet(d) || isEmbedded(d)) && ip2n(dst) === null) { print(s, `ping: cannot resolve ${dst}: Host name lookup failure`, 'err'); print(s, '(simulator: no DNS server is configured on network gear here. Use the IP address.)', 'dim'); return; }
@@ -5663,7 +5706,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       count = Math.min(count, 4);
       print(s, '', null);
       const sz = opts.size !== undefined ? opts.size : 32;
-      print(s, `Pinging ${dst} with ${sz} bytes of data:`);
+      print(s, `Pinging ${opts.label ? `${opts.label} [${dst}]` : dst} with ${sz} bytes of data:`);
       const a = RC.hostAddr(net, d.id);
       let got = 0;
       const times = [];
@@ -5683,7 +5726,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     await anim;
   }
 
-  async function doTrace(s, d, dst) {
+  async function doTrace(s, d, dst, label = null) {
     const net = G.net;
     if (ip2n(dst) === null) { print(s, `traceroute: unknown host ${dst}`, 'err'); return; }
     const tr = RC.traceroute(net, d.id, dst);
@@ -5693,7 +5736,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     if (win) {
       if (!tr.f || f.reason === 'nolink' || f.reason === 'nogw') { print(s, 'Unable to contact IP driver. General failure.', 'err'); await anim; return; }
       print(s, '', null);
-      print(s, `Tracing route to ${dst} over a maximum of 30 hops`);
+      print(s, `Tracing route to ${label ? `${label} [${dst}]` : dst} over a maximum of 30 hops`);
       print(s, '');
       if (f.reason === 'arp' && f.firstHop) {
         await sleep(900);
@@ -5741,9 +5784,15 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     const { cmd, mods } = splitPipes(line);
     const toks = RC.tokenize(cmd);
     let w = toks[0];
+    if (mods.bad) { print(s, `error: unknown pipe command '${mods.bad}'`, 'err'); return; }
     const cands = Object.keys(CFG_ROOT).filter(k => k.startsWith(w));
     if (cands.includes(w)) { /* exact */ } else if (cands.length === 1) w = cands[0];
     else { caret(s, line, toks, 0); print(s, cands.length ? `error: '${w}' is ambiguous.` : 'unknown command.', 'err'); return; }
+    if (!['show', 'run', 'commit', 'help'].includes(w) && (mods.compare || mods.displaySet || mods.filters.length)) {
+      print(s, 'syntax error.', 'err');
+      print(s, '(simulator: pipes go after show or run, for example show | compare)', 'dim');
+      return;
+    }
     const rest = toks.slice(1);
     const here = nodeAt(s.path);
     s.cmdKey = [w, ...rest].join(' ');
@@ -5879,7 +5928,15 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       if (sub === 'check') { G.ev.push({ t: 'check', dev: d.id }); print(s, 'configuration check succeeds', 'ok'); if (confirmed) print(s, '(simulator: commit confirmed is now confirmed, rollback cancelled)', 'dim'); banner(); return; }
       const m = minutes || 10;
       if (d.candidate.join('\n') === d.committed.join('\n')) {
-        if (sub === 'confirmed' && d.confirmPending) { armConfirm(d, m, null); print(s, `commit confirmed will be automatically rolled back in ${m} minutes unless confirmed`); }
+        if (sub === 'confirmed') {
+          // Junos arms the timer even when nothing changed; the rollback then restores the same config.
+          armConfirm(d, m, d.committed.slice());
+          print(s, `commit confirmed will be automatically rolled back in ${m} minutes unless confirmed`);
+          print(s, `(simulator: 1 minute = ${SIM_MIN_MS / 1000} seconds, so about ${m * SIM_MIN_MS / 1000} seconds)`, 'dim');
+          G.ev.push({ t: 'confirmed', dev: d.id });
+          logEv({ ev: 'commit', dev: d.model.hostname, removed: [], added: [], confirmed: true });
+          if (G.ev.some(e => e.t === 'autorollback' && e.dev === d.id)) nudge('emptyconfirm', 'Heads up: nothing changed since the automatic rollback, so this commit confirmed has nothing in it. The rollback took your change with it. Make the change again, then commit confirmed.');
+        }
         print(s, 'commit complete', 'ok');
         if (confirmed) { print(s, '(simulator: commit confirmed is now confirmed, rollback cancelled)', 'dim'); sfx.commit(); }
         if (sub === 'and-quit') { print(s, 'Exiting configuration mode'); s.mode = 'op'; s.path = []; return; }
@@ -5990,9 +6047,14 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
         else if (w === '-f' || w === 'do-not-fragment' || w === '-df') o.df = true;
         else if (w === '-n' && t[i + 1]) o.count = Math.max(1, Math.min(10, +t[++i] || 4));
       }
-      if (!ipTok) { print(s, t.length > 1 ? `Ping request could not find host ${t[t.length - 1]}. Please check the name and try again.` : 'Usage: ping [-l size] [-f] <ip address>', 'err'); return; }
-      s.heatKey = line.toLowerCase();
-      await doPing(s, d, ipTok, o.count || (isEmbedded(d) ? 5 : 4), o);
+      let target = ipTok;
+      if (!target && t.length > 1) {
+        const nm = t[t.length - 1], ip = resolveName(d, nm);
+        if (ip) { target = ip; o.label = nm; }
+      }
+      if (!target) { print(s, t.length > 1 ? `Ping request could not find host ${t[t.length - 1]}. Please check the name and try again.` : 'Usage: ping [-l size] [-f] <ip address>', 'err'); return; }
+      s.heatKey = line.toLowerCase().replace(o.label ? o.label.toLowerCase() : '\u0000', target);
+      await doPing(s, d, target, o.count || (isEmbedded(d) ? 5 : 4), o);
       return;
     }
     if (c === 'netsh' && !isEmbedded(d)) {
@@ -6003,7 +6065,18 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
         `${'4294967295'.padStart(6)}  ${'1'.padStart(15)}  ${'0'.padStart(12)}  ${'58211'.padStart(11)}  Loopback Pseudo-Interface 1`]);
       return;
     }
-    if (c === 'tracert' || c === 'traceroute') { if (!t[1]) { print(s, 'Usage: tracert <ip address>', 'err'); return; } s.heatKey = 'traceroute ' + t[1]; await doTrace(s, d, t[1]); return; }
+    if (c === 'tracert' || c === 'traceroute') {
+      if (!t[1]) { print(s, 'Usage: tracert <ip address>', 'err'); return; }
+      let target = t[1], label = null;
+      if (ip2n(target) === null) {
+        const ip = resolveName(d, target);
+        if (!ip) { print(s, `Unable to resolve target system name ${target}.`, 'err'); return; }
+        label = target; target = ip;
+      }
+      s.heatKey = 'traceroute ' + target;
+      await doTrace(s, d, target, label);
+      return;
+    }
     if (c === 'arp' && !isEmbedded(d)) {
       s.heatKey = 'arp';
       const a = RC.hostAddr(net, d.id);
@@ -6256,6 +6329,8 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
   /* ---------- wiring ---------- */
   function wire() {
     const inp = $('#cmd');
+    inp.addEventListener('keydown', () => { if (G) G.lastAct = Date.now(); });
+    document.addEventListener('pointerdown', () => { if (G) G.lastAct = Date.now(); }, true);
     inp.addEventListener('keydown', e => {
       const s = G && G.active;
       if (!s || G.notesOpen) return;
@@ -6270,6 +6345,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     $('#screens').addEventListener('click', () => { if (G && G.notesOpen) return; if (!window.getSelection().toString()) inp.focus(); });
     $('#notes-ta').addEventListener('input', e => {
       if (!G) return;
+      G.lastAct = Date.now();
       prog.notes = prog.notes || {};
       prog.notes[G.scn.id] = e.target.value;
       clearTimeout(G.noteT);
