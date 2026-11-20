@@ -465,7 +465,7 @@ request system configuration rescue save
 <span class="c"># workstations</span>
 ipconfig   ping   tracert   arp -a
 <span class="c"># keys</span>
-Tab completes · ? shows options
+Tab or Space completes · ? shows options
 ↑/↓ history  · sh int ter works</pre>
       <div><p class="eyebrow">Achievements</p><div class="achs" id="achs"></div></div>
       <button class="linkbtn" id="reset">Reset progress</button>
@@ -5258,7 +5258,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       '  show route hidden                show route protocol <static|ospf|direct>',
       '  show ospf neighbor               show ospf interface',
       'Pipes: | match <text>  | except <text>  | count  | last <n>',
-      'Keys: Tab completes, ? lists options, ↑/↓ history',
+      'Keys: Tab or Space completes, ? lists options, ↑/↓ history',
     ];
   }
 
@@ -5690,7 +5690,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
         '  rollback [n|rescue]    run <op command>       up / top / exit',
         '  commit confirmed [minutes]                    commit comment "why"',
         'Example: set interfaces ge-0/0/7 unit 0 family ethernet-switching vlan members OFFICE',
-        'Keys: Tab completes, ? lists what can come next']);
+        'Keys: Tab or Space completes, ? lists what can come next']);
       banner(); return;
     }
     if (w === 'set' || w === 'delete' || w === 'edit') {
@@ -6002,6 +6002,26 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
     out(s, words.map(c => '  ' + pad(c.k, 22) + (c.h || '')), 'dim');
   }
 
+  // Junos space completion: a unique keyword expands on space; an ambiguous one lists the options.
+  // Spots that also accept a name or value (VLAN names, addresses, descriptions) get a plain space.
+  // Returns true when it handled the key.
+  function onSpace(s, inp) {
+    const v = inp.value;
+    if (!v || /\s$/.test(v) || v.includes('|') || v.split('"').length % 2 === 0) return false;
+    if (inp.selectionStart !== v.length || inp.selectionEnd !== v.length) return false;
+    const info = completeInfo(s, v);
+    if (!info || info.error || !info.partial) return false;
+    if (info.list.some(c => c.k.startsWith('<') && c.k !== '<[Enter]>')) return false;
+    const words = info.list.filter(c => !c.k.startsWith('<'));
+    if (!words.length || words.some(w => w.k === info.partial)) return false;
+    if (words.length === 1) { inp.value = v.slice(0, v.length - info.partial.length) + words[0].k + ' '; return true; }
+    print(s, promptFor(s) + v, 'echo');
+    print(s, `'${info.partial}' is ambiguous.`, 'err');
+    print(s, 'Possible completions:', 'dim');
+    out(s, words.map(c => '  ' + pad(c.k, 22) + (c.h || '')), 'dim');
+    return true;
+  }
+
   /* ---------- modal ---------- */
   function modal(html, cls = '') {
     const m = $('#modal');
@@ -6166,6 +6186,7 @@ if (typeof module !== 'undefined') module.exports = SCENARIOS;
       else if (e.key === 'ArrowUp') { e.preventDefault(); if (!s.hist.length) return; s.hi = s.hi < 0 ? s.hist.length - 1 : Math.max(0, s.hi - 1); inp.value = s.hist[s.hi]; }
       else if (e.key === 'ArrowDown') { e.preventDefault(); if (s.hi < 0) return; s.hi++; if (s.hi >= s.hist.length) { s.hi = -1; inp.value = ''; } else inp.value = s.hist[s.hi]; }
       else if (e.key === 'Tab') { e.preventDefault(); if (!s.busy) onTab(s, inp); }
+      else if (e.key === ' ' && !e.ctrlKey && !e.altKey && !e.metaKey && !s.busy && RC.isNet(G.net.dev[s.dev]) && onSpace(s, inp)) e.preventDefault();
       else if (e.key === '?' && RC.isNet(G.net.dev[s.dev]) && (inp.value.split('"').length % 2 === 1)) { e.preventDefault(); if (!s.busy) onHelpKey(s, inp); }
       else if (e.key === 'l' && e.ctrlKey) { e.preventDefault(); s.screen.innerHTML = ''; }
     });
