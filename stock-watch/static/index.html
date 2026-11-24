@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stock Watch</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">Stock Watch <span id="demoBadge" class="badge" hidden>DEMO DATA</span></div>
+  <div class="status">
+    <span id="marketStatus" class="pill">—</span>
+    <span id="lastUpdated">Not loaded yet</span>
+    <span id="countdown" class="muted"></span>
+  </div>
+  <div class="controls">
+    <label>Refresh every
+      <select id="refreshSel">
+        <option value="1">1 min</option>
+        <option value="5" selected>5 min</option>
+        <option value="10">10 min</option>
+        <option value="15">15 min</option>
+      </select>
+    </label>
+    <button id="refreshNow" type="button">Refresh now</button>
+  </div>
+</header>
+
+<main class="layout">
+  <section class="watch">
+    <form id="addForm" class="addrow" autocomplete="off">
+      <input id="addInput" placeholder="Add symbols, e.g. AAPL, MSFT" aria-label="Add symbols">
+      <button type="submit">Add</button>
+      <span id="symCount" class="muted"></span>
+    </form>
+    <div class="tablewrap">
+      <table id="watchTable">
+        <thead>
+          <tr>
+            <th data-k="symbol" class="l">Symbol</th>
+            <th data-k="last">Last</th>
+            <th data-k="chgPct">Chg %</th>
+            <th data-k="volume">Volume</th>
+            <th data-k="rvol" title="Relative volume: today's volume so far vs. the average of the last 20 sessions at the same time of day">RVol</th>
+            <th data-k="vsVwapPct" title="Last price vs. today's VWAP">vs VWAP</th>
+            <th data-k="rsi5m" title="RSI(14) on 5-minute bars">RSI 5m</th>
+            <th data-k="rsiD" title="RSI(14) on daily bars">RSI D</th>
+            <th class="nosort">Today</th>
+            <th class="nosort"></th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <p class="hint muted">Click a row to chart it. Use ↑/↓ to move through the list. Click a column header to sort; click again to reverse, a third time to return to your order.</p>
+  </section>
+
+  <section class="chartpane">
+    <div class="charthead">
+      <div class="title"><strong id="chSym">—</strong> <span id="chName" class="muted"></span></div>
+      <div class="tfs" id="tfs">
+        <button data-tf="1m">1m</button><button data-tf="5m" class="on">5m</button><button data-tf="15m">15m</button><button data-tf="30m">30m</button><button data-tf="1h">1h</button><button data-tf="1D">1D</button><button data-tf="1W">1W</button>
+      </div>
+      <div class="inds" id="inds">
+        <label><input type="checkbox" data-ind="vwap" checked><span class="sw" style="--c:var(--vwap)"></span>VWAP</label>
+        <label><input type="checkbox" data-ind="ema9"><span class="sw" style="--c:var(--ema9)"></span>EMA 9</label>
+        <label><input type="checkbox" data-ind="ema21"><span class="sw" style="--c:var(--ema21)"></span>EMA 21</label>
+        <label><input type="checkbox" data-ind="sma50"><span class="sw" style="--c:var(--sma50)"></span>SMA 50</label>
+        <label><input type="checkbox" data-ind="sma200"><span class="sw" style="--c:var(--sma200)"></span>SMA 200</label>
+        <label><input type="checkbox" data-ind="bb"><span class="sw" style="--c:var(--bb)"></span>Bollinger</label>
+        <label><input type="checkbox" data-ind="volma" checked><span class="sw" style="--c:var(--volma)"></span>Vol MA 20</label>
+      </div>
+    </div>
+    <div class="chartbox">
+      <div id="legend" class="legend"></div>
+      <div id="mainChart" class="mainchart"></div>
+      <div class="rsilabel muted" id="rsiLabel">RSI 14</div>
+      <div id="rsiChart" class="rsichart"></div>
+      <div id="chartMsg" class="chartmsg" hidden></div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot muted">
+  Data: Yahoo Finance (unofficial, personal use). Charts by <a href="https://www.tradingview.com/" target="_blank" rel="noopener">TradingView Lightweight Charts™</a>. Not investment advice.
+</footer>
+
+<script src="vendor/lightweight-charts.standalone.production.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

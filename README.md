@@ -7,3 +7,6 @@ A network troubleshooting game for engineers. Take tickets from small businesses
 **Play:** https://sigurd-41.github.io/Ninja-Space/network-ninja/
 
 Runs entirely in the browser, single file at [`network-ninja/index.html`](network-ninja/index.html). Progress is saved in your browser. (The old `root-cause/` link redirects here.)
+
+## Stock Watch
+A personal stock watchlist with charts, volume, VWAP and RSI that runs on your own computer. See [`stock-watch/README.md`](stock-watch/README.md).
